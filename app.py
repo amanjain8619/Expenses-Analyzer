@@ -36,7 +36,7 @@ def get_category(merchant):
     return "Others"
 
 # ------------------------------
-# Extract transactions from PDF (text-based only)
+# Extract transactions from PDF (text-based only, robust CR/DR)
 # ------------------------------
 def extract_transactions_from_pdf(pdf_file, account_name):
     transactions = []
@@ -48,13 +48,23 @@ def extract_transactions_from_pdf(pdf_file, account_name):
             lines = [l.strip() for l in text.split("\n") if l.strip()]
 
             for line in lines:
-                match = re.match(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s?(DR|CR)?", line)
+                # Match: date, merchant, amount, optional CR/DR variations
+                match = re.match(
+                    r"(\d{2}/\d{2}/\d{4})[\s:]+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
+                    line
+                )
                 if match:
-                    date, merchant, amount, drcr = match.groups()
+                    date, merchant, amount, drcr, _ = match.groups()
                     amt = round(float(amount.replace(",", "")), 2)
-                    if drcr == "CR":
+
+                    # Decide Debit/Credit
+                    if drcr and drcr.strip().lower().startswith("cr"):
                         amt = -amt
-                    transactions.append([date, merchant.strip(), amt, drcr if drcr else "DR", account_name])
+                        tr_type = "CR"
+                    else:
+                        tr_type = "DR"
+
+                    transactions.append([date, merchant.strip(), amt, tr_type, account_name])
 
             st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
 
@@ -97,7 +107,7 @@ def normalize_dataframe(df, account_name):
         df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
         df["Type"] = df.apply(lambda x: "DR" if x["Debit"] > 0 else "CR", axis=1)
     elif "Amount" in df and "Type" in df:
-        df["Amount"] = df.apply(lambda x: -abs(x["Amount"]) if str(x["Type"]).upper() == "CR" else abs(x["Amount"]), axis=1)
+        df["Amount"] = df.apply(lambda x: -abs(x["Amount"]) if str(x["Type"]).upper().startswith("CR") else abs(x["Amount"]), axis=1)
     elif "Amount" in df and "Type" not in df:
         df["Type"] = "DR"
 
