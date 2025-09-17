@@ -42,57 +42,30 @@ def extract_transactions_from_pdf(pdf_file, account_name):
     transactions = []
     with pdfplumber.open(pdf_file) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text()
+            if not text:
+                continue
 
-            # 1️⃣ Try table extraction (BoB-style)
-            table = page.extract_table()
-            if table:
-                headers = [str(h).strip().lower() for h in table[0]]
-                for row in table[1:]:
-                    if not any(row):
-                        continue
-                    row_data = dict(zip(headers, row))
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-                    date = row_data.get("date") or row_data.get("txn date") or row_data.get("transaction date")
-                    merchant = row_data.get("description") or row_data.get("narration") or ""
-
-                    debit = row_data.get("debit") or row_data.get("withdrawal") or ""
-                    credit = row_data.get("credit") or row_data.get("deposit") or ""
-
-                    if debit and str(debit).strip() not in ["", "NaN", "nan"]:
-                        try:
-                            amt = round(float(str(debit).replace(",", "")), 2)
-                            tr_type = "DR"
-                            transactions.append([date, merchant.strip(), amt, tr_type, account_name])
-                        except:
-                            continue
-                    elif credit and str(credit).strip() not in ["", "NaN", "nan"]:
-                        try:
-                            amt = -round(float(str(credit).replace(",", "")), 2)
-                            tr_type = "CR"
-                            transactions.append([date, merchant.strip(), amt, tr_type, account_name])
-                        except:
-                            continue
-
-            # 2️⃣ Fallback: regex parsing (HDFC-style free text with optional time)
-            else:
-                text = page.extract_text()
-                if not text:
-                    continue
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                for line in lines:
-                    match = re.match(
-                        r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
-                        line
-                    )
-                    if match:
-                        date, merchant, amount, drcr, _ = match.groups()
-                        amt = round(float(amount.replace(",", "")), 2)
-                        if drcr and drcr.strip().lower().startswith("cr"):
-                            amt = -amt
-                            tr_type = "CR"
-                        else:
-                            tr_type = "DR"
-                        transactions.append([date, merchant.strip(), amt, tr_type, account_name])
+            for line in lines:
+                # BoB / HDFC format:
+                # 14/08/2025 RAZORPAY ... 1152.42 CR
+                # 15/08/2025 SWIGGY ... 294.00 DR
+                # 16/08/2025 AMAZON ... 123.45
+                match = re.match(
+                    r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?",
+                    line
+                )
+                if match:
+                    date, merchant, amount, drcr = match.groups()
+                    amt = round(float(amount.replace(",", "")), 2)
+                    if drcr and drcr.strip().lower().startswith("cr"):
+                        amt = -amt
+                        tr_type = "CR"
+                    else:
+                        tr_type = "DR"
+                    transactions.append([date, merchant.strip(), amt, tr_type, account_name])
 
             st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
 
