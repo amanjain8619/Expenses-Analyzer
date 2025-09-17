@@ -74,7 +74,7 @@ def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
 
-    # Read first 3 pages (HDFC uses page 1, BoB often page 2)
+    # Read first 3 pages (HDFC = page 1, BoB often = page 2)
     with pdfplumber.open(pdf_file) as pdf:
         for i in range(min(3, len(pdf.pages))):
             page_text = pdf.pages[i].extract_text()
@@ -84,11 +84,12 @@ def extract_summary_from_pdf(pdf_file):
     if not text_all:
         return summary
 
-    # Expanded regex patterns
+    # Regex patterns expanded for HDFC + BoB
     patterns = {
         "Statement Date": [
             r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-            r"Stmt Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})"
+            r"Stmt Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To"
         ],
         "Payment Due Date": [
             r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
@@ -99,17 +100,17 @@ def extract_summary_from_pdf(pdf_file):
             r"Opening Balance\s*[:\-]?\s*([\d,]+\.\d{2})"
         ],
         "Total Due": [
-            r"(?:Total Amount Due|Total Due)\s*[:\-]?\s*([\d,]+\.\d{2})",
+            r"(?:Total Dues|Total Amount Due|Total Due)\s*[:\-]?\s*([\d,]+\.\d{2})",
             r"Amount Due\s*[:\-]?\s*([\d,]+\.\d{2})"
         ],
         "Minimum Due": [
             r"(?:Minimum Amount Due|Minimum Due)\s*[:\-]?\s*([\d,]+\.\d{2})"
         ],
         "Total Purchases": [
-            r"(?:Total Purchases|Total Debit|Purchases and Other Debits)\s*[:\-]?\s*([\d,]+\.\d{2})"
+            r"(?:Total Purchases|Purchases/ Debits|Purchases and Other Debits)\s*[:\-]?\s*([\d,]+\.\d{2})"
         ],
         "Total Payments": [
-            r"(?:Total Payments|Total Credit|Payments and Other Credits)\s*[:\-]?\s*([\d,]+\.\d{2})"
+            r"(?:Total Payments|Payments/ Credits|Payments and Other Credits)\s*[:\-]?\s*([\d,]+\.\d{2})"
         ],
         "Credit Limit": [
             r"(?:Credit Limit|Total Credit Limit)\s*[:\-]?\s*([\d,]+\.\d{2})"
@@ -120,12 +121,14 @@ def extract_summary_from_pdf(pdf_file):
     }
 
     for key, regex_list in patterns.items():
+        found = False
         for pattern in regex_list:
             m = re.search(pattern, text_all, re.IGNORECASE)
             if m:
                 summary[key] = m.group(1).replace(",", "")
+                found = True
                 break
-        if key not in summary:  # fallback
+        if not found:
             summary[key] = "-"
 
     return summary
@@ -242,7 +245,11 @@ def display_summary(summary, account_name):
         </div>
         """
 
-    try_float = lambda v: float(v) if v.replace(".", "", 1).isdigit() else 0.0
+    def try_float(v):
+        try:
+            return float(v)
+        except:
+            return 0.0
 
     total_due_val = try_float(summary.get("Total Due", "0"))
     min_due_val = try_float(summary.get("Minimum Due", "0"))
