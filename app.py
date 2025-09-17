@@ -1,130 +1,74 @@
-import streamlit as st
-import pandas as pd
-import pdfplumber
-import re
-from rapidfuzz import process
-from io import BytesIO
-import os
+def extract_summary_from_pdf(pdf_file):
+    summary = {}
+    text_all = ""
 
-# ==============================
-# Load vendor mapping
-# ==============================
-VENDOR_FILE = "vendors.csv"
-
-if os.path.exists(VENDOR_FILE):
-    vendor_map = pd.read_csv(VENDOR_FILE)
-else:
-    vendor_map = pd.DataFrame(columns=["merchant", "category"])
-    vendor_map.to_csv(VENDOR_FILE, index=False)
-
-# ------------------------------
-# Fuzzy matching to find category
-# ------------------------------
-def get_category(merchant):
-    m = str(merchant).lower()
-    matches = process.extractOne(
-        m,
-        vendor_map["merchant"].str.lower().tolist(),
-        score_cutoff=80
-    )
-    if matches:
-        matched_merchant = matches[0]
-        category = vendor_map.loc[
-            vendor_map["merchant"].str.lower() == matched_merchant, "category"
-        ].iloc[0]
-        return category
-    return "Others"
-
-# ------------------------------
-# Debug PDF (raw text + tables)
-# ------------------------------
-def debug_pdf_summary(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         for i in range(min(3, len(pdf.pages))):
-            st.subheader(f"🔍 Debug Page {i+1}")
-            
-            # Extract text
-            text = pdf.pages[i].extract_text()
-            if text:
-                st.text_area(f"Raw Text Page {i+1}", text, height=300)
-            
-            # Extract tables
+            page_text = pdf.pages[i].extract_text()
+            if page_text:
+                text_all += "\n" + page_text
+
             tables = pdf.pages[i].extract_tables()
-            if tables:
-                for t_idx, table in enumerate(tables):
-                    st.write(f"Table {t_idx+1} (Page {i+1})")
-                    st.table(table)
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+                headers = [str(h).strip() for h in table[0] if h]
+                row = [str(v).strip() for v in table[1] if v]
 
-# ------------------------------
-# Extract transactions from PDF
-# ------------------------------
-def extract_transactions_from_pdf(pdf_file, account_name):
-    transactions = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if not text:
-                continue
+                # Case 1: HDFC style (headers + values)
+                if any("Due Date" in h or "Total Dues" in h or "Credit Limit" in h for h in headers):
+                    for h, v in zip(headers, row):
+                        if not v or v.lower() in ["nan", ""]:
+                            continue
+                        if "Payment Due Date" in h:
+                            summary["Payment Due Date"] = v.replace(",", "")
+                        elif "Total Dues" in h or "Total Due" in h:
+                            summary["Total Due"] = v.replace(",", "")
+                        elif "Minimum" in h:
+                            summary["Minimum Due"] = v.replace(",", "")
+                        elif "Credit Limit" in h and "Available" not in h:
+                            summary["Credit Limit"] = v.replace(",", "")
+                        elif "Available Credit" in h:
+                            summary["Available Credit"] = v.replace(",", "")
+                        elif "Available Cash" in h:
+                            summary["Available Cash"] = v.replace(",", "")
+                        elif "Opening Balance" in h:
+                            summary["Previous Balance"] = v.replace(",", "")
+                        elif "Payment" in h:
+                            summary["Total Payments"] = v.replace(",", "")
+                        elif "Purchase" in h:
+                            summary["Total Purchases"] = v.replace(",", "")
+                        elif "Finance" in h:
+                            summary["Finance Charges"] = v.replace(",", "")
 
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-            for line in lines:
-                match = re.match(
-                    r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?",
-                    line
-                )
-                if match:
-                    date, merchant, amount, drcr = match.groups()
-                    amt = round(float(amount.replace(",", "")), 2)
-                    if drcr and drcr.strip().lower().startswith("cr"):
-                        amt = -amt
-                        tr_type = "CR"
+                # Case 2: BoB style (row of 4 numbers)
+                numbers = re.findall(r"[\d,]+\.\d{2}", " ".join(row))
+                if len(numbers) == 4:
+                    if not summary.get("Credit Limit"):
+                        summary["Credit Limit"] = numbers[0].replace(",", "")
+                        summary["Available Credit"] = numbers[1].replace(",", "")
+                        summary["Total Due"] = numbers[2].replace(",", "")
+                        summary["Minimum Due"] = numbers[3].replace(",", "")
                     else:
-                        tr_type = "DR"
-                    transactions.append([date, merchant.strip(), amt, tr_type, account_name])
+                        summary["Total Payments"] = numbers[0].replace(",", "")
+                        summary["Other Charges"] = numbers[1].replace(",", "")
+                        summary["Total Purchases"] = numbers[2].replace(",", "")
+                        summary["Previous Balance"] = numbers[3].replace(",", "")
 
-            st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
+    # Regex fallback (Statement Date etc.)
+    patterns = {
+        "Statement Date": [
+            r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To"
+        ],
+    }
 
-    return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
+    for key, regex_list in patterns.items():
+        if key not in summary:
+            for pattern in regex_list:
+                m = re.search(pattern, text_all, re.IGNORECASE)
+                if m:
+                    summary[key] = m.group(1).replace(",", "")
+                    break
 
-# ------------------------------
-# Dummy Summary Extractor (placeholder)
-# ------------------------------
-def extract_summary_from_pdf(pdf_file):
-    return {}  # leave empty until we confirm correct regex
-
-# ------------------------------
-# Expense analysis
-# ------------------------------
-def analyze_expenses(df):
-    st.write("💰 **Total Spent:**", f"{df['Amount'].sum():,.2f}")
-    st.write("📊 **Expense by Category**")
-    st.bar_chart(df.groupby("Category")["Amount"].sum().round(2))
-    st.write("🏦 **Top 5 Merchants**")
-    st.dataframe(df.groupby("Merchant")["Amount"].sum().round(2).sort_values(ascending=False).head())
-
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-st.title("💳 Multi-Account Expense Analyzer (Debug Mode)")
-st.write("Upload your statements and view raw extracted text/tables for debugging.")
-
-uploaded_files = st.file_uploader(
-    "Upload Statements",
-    type=["pdf"],
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    for uploaded_file in uploaded_files:
-        account_name = st.text_input(f"Enter account name for {uploaded_file.name}", value=uploaded_file.name)
-
-        if account_name and uploaded_file.name.endswith(".pdf"):
-            df = extract_transactions_from_pdf(uploaded_file, account_name)
-
-            # 🔍 Debug raw PDF extraction
-            debug_pdf_summary(uploaded_file)
-
-            if not df.empty:
-                st.subheader("📑 Extracted Transactions")
-                st.dataframe(df)
+    return summary
