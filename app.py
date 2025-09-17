@@ -6,6 +6,7 @@ from rapidfuzz import process
 from io import BytesIO
 import os
 import itertools
+import math
 
 # ==============================
 # Load vendor mapping
@@ -29,74 +30,130 @@ def fmt_num(val):
 
 def parse_number(s):
     try:
-        return float(s.replace(",", ""))
+        return float(str(s).replace(",", "").strip())
     except:
         return None
 
-# Choose best assignment for 4 numbers using constraints + heuristics
-def map_four_numbers(nums, summary_exists=False):
+# Scoring for candidate primary mapping (Credit Limit, Available Credit, Total Due, Minimum Due)
+def score_primary_candidate(mapping, nums):
+    # mapping: dict with keys 'Credit Limit','Available Credit','Total Due','Minimum Due' -> floats
+    # nums: original list of floats for this row
+    # Returns numeric score (higher is better)
+    cl = mapping.get("Credit Limit")
+    av = mapping.get("Available Credit")
+    td = mapping.get("Total Due")
+    md = mapping.get("Minimum Due")
+    if any(x is None for x in [cl, av, td, md]):
+        return -1e6
+    score = 0.0
+    # basic sanity
+    if cl < 0 or av < 0 or td < 0 or md < 0:
+        return -1e6
+    # credit >= available
+    if cl + 1e-6 >= av:
+        score += 3.0
+    else:
+        score -= 5.0
+    # minimum <= total
+    if md <= td + 1e-6:
+        score += 3.0
+    else:
+        score -= 5.0
+    # prefer cl being the maximum of row
+    if abs(cl - max(nums)) < 1e-6:
+        score += 1.5
+    # prefer available less than cl
+    if av <= cl:
+        score += 0.5
+    # prefer total_due positive
+    if td > 0:
+        score += 0.5
+    # prefer cl reasonably large ( > 1000 )
+    if cl >= 1000:
+        score += 0.5
+    # penalize wildly inconsistent totals (total >> cl * 3)
+    if cl > 0 and td > cl * 3:
+        score -= 2.0
+    return score
+
+# Scoring for secondary candidate mapping (Total Payments, Other Charges, Total Purchases, Previous Balance)
+def score_secondary_candidate(mapping):
+    tp = mapping.get("Total Payments")
+    oc = mapping.get("Other Charges")
+    purch = mapping.get("Total Purchases")
+    prev = mapping.get("Previous Balance")
+    if any(x is None for x in [tp, oc, purch, prev]):
+        return -1e6
+    # basic non-negative check
+    if any(x < -0.01 for x in [tp, oc, purch, prev]):
+        return -1e6
+    score = 0.0
+    # prefer purchases >= payments (often true)
+    if purch + 1e-6 >= tp:
+        score += 1.5
+    # prefer prev to be reasonably close to purchases (not always true, small weight)
+    if purch > 0 and abs(prev - purch) / (purch + 1e-6) < 0.4:
+        score += 0.8
+    # prefer non-zero purchases or payments
+    if purch > 0:
+        score += 0.5
+    if tp >= 0:
+        score += 0.2
+    return score
+
+# Try to find best primary mapping across numeric rows
+def choose_best_primary_mapping(numeric_rows):
     """
-    nums: list of 4 floats (in order as found in table row)
-    summary_exists: if True, means we've already mapped a 4-number row earlier,
-                   so this is likely Payments/OtherCharges/Purchases/PreviousBalance row.
-    Returns dict mapping fields to formatted strings.
+    numeric_rows: list of tuples (nums_list, page_idx, table_idx, row_idx, raw_row_text)
+    returns: (best_mapping_dict, primary_row_index_in_numeric_rows, used_perm)
     """
     fields_primary = ["Credit Limit", "Available Credit", "Total Due", "Minimum Due"]
+    best_score = -1e9
+    best_map = None
+    best_idx = None
+    best_perm = None
+
+    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
+        # perms of mapping numbers to fields
+        for perm in itertools.permutations(range(4)):
+            candidate = {fields_primary[i]: nums[perm[i]] for i in range(4)}
+            s = score_primary_candidate(candidate, nums)
+            if s > best_score:
+                best_score = s
+                best_map = candidate
+                best_idx = idx
+                best_perm = perm
+
+    if best_map is None:
+        return None, None, None
+
+    # format mapping
+    formatted = {k: fmt_num(v) for k, v in best_map.items()}
+    return formatted, best_idx, best_perm
+
+# Choose mappings for remaining numeric rows as secondary
+def map_secondary_rows(numeric_rows, exclude_index=None):
     fields_secondary = ["Total Payments", "Other Charges", "Total Purchases", "Previous Balance"]
-
-    # Constraint check function
-    def valid_primary_map(m):
-        cl = m.get("Credit Limit")
-        av = m.get("Available Credit")
-        td = m.get("Total Due")
-        md = m.get("Minimum Due")
-        if cl is not None and av is not None:
-            if cl + 1e-6 < av:
-                return False
-        if td is not None and md is not None:
-            if md - td > 1e-6:  # minimum should be <= total
-                return False
-        return True
-
-    if not summary_exists:
-        # try default ordering first
-        m0 = dict(zip(fields_primary, nums))
-        if valid_primary_map(m0):
-            return {k: f"{v:,.2f}" for k, v in m0.items()}
-
-        # try permutations of mapping positions to fields
-        candidates = []
+    mapped = {}
+    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
+        if idx == exclude_index:
+            continue
+        best_score = -1e9
+        best_map = None
+        best_perm = None
         for perm in itertools.permutations(range(4)):
-            m = {fields_primary[i]: nums[perm[i]] for i in range(4)}
-            if valid_primary_map(m):
-                candidates.append(m)
-        if candidates:
-            # choose the candidate with largest Credit Limit
-            best = max(candidates, key=lambda x: x.get("Credit Limit", 0) or 0)
-            return {k: f"{v:,.2f}" for k, v in best.items()}
-
-        # fallback: assume descending order: credit, available, total, minimum
-        sorted_nums = sorted(nums, reverse=True)
-        fallback = {
-            "Credit Limit": sorted_nums[0],
-            "Available Credit": sorted_nums[1],
-            "Total Due": sorted_nums[2],
-            "Minimum Due": sorted_nums[3],
-        }
-        return {k: f"{v:,.2f}" for k, v in fallback.items()}
-    else:
-        # secondary row mapping (payments etc.)
-        m0 = dict(zip(fields_secondary, nums))
-        # Basic sanity checks: values should be non-negative
-        if all(v >= 0 for v in nums):
-            return {k: f"{v:,.2f}" for k, v in m0.items()}
-        # try permutations
-        for perm in itertools.permutations(range(4)):
-            m = {fields_secondary[i]: nums[perm[i]] for i in range(4)}
-            if all(v >= 0 for v in m.values()):
-                return {k: f"{v:,.2f}" for k, v in m.items()}
-        # fallback
-        return {k: f"{v:,.2f}" for k, v in m0.items()}
+            candidate = {fields_secondary[i]: nums[perm[i]] for i in range(4)}
+            s = score_secondary_candidate(candidate)
+            if s > best_score:
+                best_score = s
+                best_map = candidate
+                best_perm = perm
+        if best_map:
+            # add if keys not present
+            for k, v in best_map.items():
+                if k not in mapped:
+                    mapped[k] = fmt_num(v)
+    return mapped
 
 # ------------------------------
 # Fuzzy matching to find category
@@ -159,7 +216,7 @@ def extract_transactions_from_pdf(pdf_file, account_name):
 def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
-    numeric_rows_collected = []  # list of (nums_list, page_idx, row_idx, raw_row_text)
+    numeric_rows_collected = []  # list of (nums_list, page_idx, table_idx, row_idx, raw_row_text)
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
@@ -179,18 +236,15 @@ def extract_summary_from_pdf(pdf_file):
 
                     # 1) Header->value mapping only when the value row contains at least one numeric token
                     header_keywords = ["due", "total", "payment", "credit limit", "available", "purchase", "opening", "minimum", "payments", "purchases"]
-                    # Look for header rows in first two rows
                     for ridx in range(min(2, len(rows))):
                         row_text = " ".join(rows[ridx]).lower()
                         if any(k in row_text for k in header_keywords) and (ridx + 1) < len(rows):
                             values_row = rows[ridx + 1]
-                            # ensure values_row has at least one numeric token
                             numbers_in_values = re.findall(r"[\d,]+\.\d{2}", " ".join(values_row))
                             if not numbers_in_values:
-                                continue  # skip header mapping if next row is non-numeric
+                                continue
                             headers = rows[ridx]
                             values = values_row
-                            # map headers->values but only where value is numeric
                             for h, v in zip(headers, values):
                                 if not v:
                                     continue
@@ -220,7 +274,6 @@ def extract_summary_from_pdf(pdf_file):
                                         summary["Total Purchases"] = fmt_num(v_clean)
                                     elif "finance" in h_low:
                                         summary["Finance Charges"] = fmt_num(v_clean)
-                            # after header mapping continue to next table
                             continue
 
                     # 2) Collect any rows with exactly 4 numeric values (BoB-like)
@@ -240,26 +293,20 @@ def extract_summary_from_pdf(pdf_file):
                             if ok:
                                 numeric_rows_collected.append((nums_float, i, t_idx, ridx, row_text))
 
-        # If numeric rows found, pick primary row as one with largest max value (credit info)
+        # Choose best primary mapping among numeric rows using permutation scoring
         if numeric_rows_collected:
-            # sort by max value descending
-            numeric_rows_collected_sorted = sorted(numeric_rows_collected, key=lambda x: max(x[0]) if x[0] else 0, reverse=True)
-            # primary
-            primary = numeric_rows_collected_sorted[0][0]
-            mapped_primary = map_four_numbers(primary, summary_exists=bool(summary.get("Credit Limit")))
-            # merge primary
-            for k, v in mapped_primary.items():
-                if k not in summary:
-                    summary[k] = v
-            # remaining rows -> map as secondary if any
-            for other in numeric_rows_collected_sorted[1:]:
-                nums = other[0]
-                mapped_secondary = map_four_numbers(nums, summary_exists=True)
-                for k, v in mapped_secondary.items():
+            primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
+            if primary_map:
+                for k, v in primary_map.items():
+                    if k not in summary:
+                        summary[k] = v
+                # map remaining rows as secondary
+                secondary_mapped = map_secondary_rows(numeric_rows_collected, exclude_index=primary_idx)
+                for k, v in secondary_mapped.items():
                     if k not in summary:
                         summary[k] = v
 
-        # Regex fallback for Statement Date if still missing
+        # Regex fallback for Statement Date if missing
         if "Statement Date" not in summary:
             patterns = [
                 r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
@@ -277,13 +324,12 @@ def extract_summary_from_pdf(pdf_file):
     if not summary:
         summary = {"Info": "No summary details detected in PDF."}
 
-    # Ensure numeric fields formatted
+    # Final numeric normalization
     for k in list(summary.keys()):
-        # if the value looks like a number without comma formatting, attempt to format
+        # if numeric-like string, format
         if isinstance(summary[k], (int, float)):
             summary[k] = fmt_num(summary[k])
         else:
-            # if it's numeric string, standardize it
             mnum = re.match(r"^\s*[\d,]+(?:\.\d+)?\s*$", str(summary[k]))
             if mnum:
                 try:
