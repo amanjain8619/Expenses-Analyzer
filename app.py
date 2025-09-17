@@ -5,8 +5,6 @@ import re
 from rapidfuzz import process
 from io import BytesIO
 import os
-import itertools
-import math
 
 # ==============================
 # Load vendor mapping
@@ -24,136 +22,9 @@ else:
 # ------------------------------
 def fmt_num(val):
     try:
-        return f"{float(val):,.2f}"
+        return f"{float(str(val).replace(',', '').strip()):,.2f}"
     except:
         return val
-
-def parse_number(s):
-    try:
-        return float(str(s).replace(",", "").strip())
-    except:
-        return None
-
-# Scoring for candidate primary mapping (Credit Limit, Available Credit, Total Due, Minimum Due)
-def score_primary_candidate(mapping, nums):
-    # mapping: dict with keys 'Credit Limit','Available Credit','Total Due','Minimum Due' -> floats
-    # nums: original list of floats for this row
-    # Returns numeric score (higher is better)
-    cl = mapping.get("Credit Limit")
-    av = mapping.get("Available Credit")
-    td = mapping.get("Total Due")
-    md = mapping.get("Minimum Due")
-    if any(x is None for x in [cl, av, td, md]):
-        return -1e6
-    score = 0.0
-    # basic sanity
-    if cl < 0 or av < 0 or td < 0 or md < 0:
-        return -1e6
-    # credit >= available
-    if cl + 1e-6 >= av:
-        score += 3.0
-    else:
-        score -= 5.0
-    # minimum <= total
-    if md <= td + 1e-6:
-        score += 3.0
-    else:
-        score -= 5.0
-    # prefer cl being the maximum of row
-    if abs(cl - max(nums)) < 1e-6:
-        score += 1.5
-    # prefer available less than cl
-    if av <= cl:
-        score += 0.5
-    # prefer total_due positive
-    if td > 0:
-        score += 0.5
-    # prefer cl reasonably large ( > 1000 )
-    if cl >= 1000:
-        score += 0.5
-    # penalize wildly inconsistent totals (total >> cl * 3)
-    if cl > 0 and td > cl * 3:
-        score -= 2.0
-    return score
-
-# Scoring for secondary candidate mapping (Total Payments, Other Charges, Total Purchases, Previous Balance)
-def score_secondary_candidate(mapping):
-    tp = mapping.get("Total Payments")
-    oc = mapping.get("Other Charges")
-    purch = mapping.get("Total Purchases")
-    prev = mapping.get("Previous Balance")
-    if any(x is None for x in [tp, oc, purch, prev]):
-        return -1e6
-    # basic non-negative check
-    if any(x < -0.01 for x in [tp, oc, purch, prev]):
-        return -1e6
-    score = 0.0
-    # prefer purchases >= payments (often true)
-    if purch + 1e-6 >= tp:
-        score += 1.5
-    # prefer prev to be reasonably close to purchases (not always true, small weight)
-    if purch > 0 and abs(prev - purch) / (purch + 1e-6) < 0.4:
-        score += 0.8
-    # prefer non-zero purchases or payments
-    if purch > 0:
-        score += 0.5
-    if tp >= 0:
-        score += 0.2
-    return score
-
-# Try to find best primary mapping across numeric rows
-def choose_best_primary_mapping(numeric_rows):
-    """
-    numeric_rows: list of tuples (nums_list, page_idx, table_idx, row_idx, raw_row_text)
-    returns: (best_mapping_dict, primary_row_index_in_numeric_rows, used_perm)
-    """
-    fields_primary = ["Credit Limit", "Available Credit", "Total Due", "Minimum Due"]
-    best_score = -1e9
-    best_map = None
-    best_idx = None
-    best_perm = None
-
-    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
-        # perms of mapping numbers to fields
-        for perm in itertools.permutations(range(4)):
-            candidate = {fields_primary[i]: nums[perm[i]] for i in range(4)}
-            s = score_primary_candidate(candidate, nums)
-            if s > best_score:
-                best_score = s
-                best_map = candidate
-                best_idx = idx
-                best_perm = perm
-
-    if best_map is None:
-        return None, None, None
-
-    # format mapping
-    formatted = {k: fmt_num(v) for k, v in best_map.items()}
-    return formatted, best_idx, best_perm
-
-# Choose mappings for remaining numeric rows as secondary
-def map_secondary_rows(numeric_rows, exclude_index=None):
-    fields_secondary = ["Total Payments", "Other Charges", "Total Purchases", "Previous Balance"]
-    mapped = {}
-    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
-        if idx == exclude_index:
-            continue
-        best_score = -1e9
-        best_map = None
-        best_perm = None
-        for perm in itertools.permutations(range(4)):
-            candidate = {fields_secondary[i]: nums[perm[i]] for i in range(4)}
-            s = score_secondary_candidate(candidate)
-            if s > best_score:
-                best_score = s
-                best_map = candidate
-                best_perm = perm
-        if best_map:
-            # add if keys not present
-            for k, v in best_map.items():
-                if k not in mapped:
-                    mapped[k] = fmt_num(v)
-    return mapped
 
 # ------------------------------
 # Fuzzy matching to find category
@@ -206,239 +77,80 @@ def extract_transactions_from_pdf(pdf_file, account_name):
                         tr_type = "DR"
                     transactions.append([date, merchant.strip(), amt, tr_type, account_name])
 
-            st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
-
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
 # ------------------------------
-# Extract summary from PDF (robust HDFC + BoB mapping)
+# Extract summary from PDF (keyword-driven for HDFC + BoB)
 # ------------------------------
 def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
-    numeric_rows_collected = []  # list of (nums_list, page_idx, table_idx, row_idx, raw_row_text)
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
-            for i in range(min(3, len(pdf.pages))):
-                page = pdf.pages[i]
-                page_text = page.extract_text()
+            for i in range(min(3, len(pdf.pages))):  # first 3 pages usually enough
+                page_text = pdf.pages[i].extract_text()
                 if page_text:
                     text_all += "\n" + page_text
 
-                tables = page.extract_tables() or []
-                for t_idx, table in enumerate(tables):
-                    if not table or len(table) == 0:
-                        continue
+        # Clean lines
+        lines = [l.strip() for l in text_all.split("\n") if l.strip()]
 
-                    # Normalize rows (strip)
-                    rows = [[(str(cell).strip() if cell is not None else "") for cell in r] for r in table]
+        # Keyword → field mapping
+        keyword_map = {
+            "statement date": "Statement Date",
+            "payment due date": "Payment Due Date",
+            "total due": "Total Due",
+            "total dues": "Total Due",
+            "minimum amount due": "Minimum Due",
+            "minimum due": "Minimum Due",
+            "credit limit": "Credit Limit",
+            "available credit": "Available Credit",
+            "available cash": "Available Cash",
+            "previous balance": "Previous Balance",
+            "opening balance": "Previous Balance",
+            "payments / credits": "Payments / Credits",
+            "payment/credits": "Payments / Credits",
+            "purchases / debits": "Purchases / Debits",
+            "purchases/debits": "Purchases / Debits",
+            "other charges": "Other Charges",
+            "finance charges": "Finance Charges",
+        }
 
-                    # 1) Header->value mapping only when the value row contains at least one numeric token
-                    header_keywords = ["due", "total", "payment", "credit limit", "available", "purchase", "opening", "minimum", "payments", "purchases"]
-                    for ridx in range(min(2, len(rows))):
-                        row_text = " ".join(rows[ridx]).lower()
-                        if any(k in row_text for k in header_keywords) and (ridx + 1) < len(rows):
-                            values_row = rows[ridx + 1]
-                            numbers_in_values = re.findall(r"[\d,]+\.\d{2}", " ".join(values_row))
-                            if not numbers_in_values:
-                                continue
-                            headers = rows[ridx]
-                            values = values_row
-                            for h, v in zip(headers, values):
-                                if not v:
-                                    continue
-                                v_nums = re.findall(r"[\d,]+\.\d{2}", v)
-                                v_clean = v.replace(",", "")
-                                h_low = h.lower()
-                                if v_nums:
-                                    if "payment due" in h_low or "due date" in h_low or "payment due date" in h_low:
-                                        summary["Payment Due Date"] = v_clean
-                                    elif "statement date" in h_low:
-                                        summary["Statement Date"] = v_clean
-                                    elif "total dues" in h_low or "total due" in h_low:
-                                        summary["Total Due"] = fmt_num(v_clean)
-                                    elif "minimum" in h_low:
-                                        summary["Minimum Due"] = fmt_num(v_clean)
-                                    elif "credit limit" in h_low and "available" not in h_low:
-                                        summary["Credit Limit"] = fmt_num(v_clean)
-                                    elif "available credit" in h_low or "available credit limit" in h_low:
-                                        summary["Available Credit"] = fmt_num(v_clean)
-                                    elif "available cash" in h_low:
-                                        summary["Available Cash"] = fmt_num(v_clean)
-                                    elif "opening balance" in h_low:
-                                        summary["Previous Balance"] = fmt_num(v_clean)
-                                    elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip():
-                                        summary["Total Payments"] = fmt_num(v_clean)
-                                    elif "purchase" in h_low or "debit" in h_low:
-                                        summary["Total Purchases"] = fmt_num(v_clean)
-                                    elif "finance" in h_low:
-                                        summary["Finance Charges"] = fmt_num(v_clean)
-                            continue
+        # Scan line by line for known keywords + numbers
+        for line in lines:
+            for key, field in keyword_map.items():
+                if key in line.lower():
+                    nums = re.findall(r"[\d,]+\.\d{2}", line)
+                    if nums:
+                        summary[field] = fmt_num(nums[-1])  # last number on line is usually the value
 
-                    # 2) Collect any rows with exactly 4 numeric values (BoB-like)
-                    for ridx, r in enumerate(rows):
-                        row_text = " ".join(r)
-                        numbers = re.findall(r"[\d,]+\.\d{2}", row_text)
-                        if len(numbers) == 4:
-                            nums_clean = [n.replace(",", "") for n in numbers]
-                            nums_float = []
-                            ok = True
-                            for n in nums_clean:
-                                try:
-                                    nums_float.append(float(n))
-                                except:
-                                    ok = False
-                                    break
-                            if ok:
-                                numeric_rows_collected.append((nums_float, i, t_idx, ridx, row_text))
-
-        # Choose best primary mapping among numeric rows using permutation scoring
-        if numeric_rows_collected:
-            primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
-            if primary_map:
-                for k, v in primary_map.items():
-                    if k not in summary:
-                        summary[k] = v
-                # map remaining rows as secondary
-                secondary_mapped = map_secondary_rows(numeric_rows_collected, exclude_index=primary_idx)
-                for k, v in secondary_mapped.items():
-                    if k not in summary:
-                        summary[k] = v
-
-        # Regex fallback for Statement Date if missing
+        # Regex fallback for missing Statement Date
         if "Statement Date" not in summary:
-            patterns = [
-                r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-                r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To"
-            ]
-            for pattern in patterns:
-                m = re.search(pattern, text_all, re.IGNORECASE)
-                if m:
-                    summary["Statement Date"] = m.group(1).replace(",", "")
-                    break
+            m = re.search(r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", text_all, re.IGNORECASE)
+            if m:
+                summary["Statement Date"] = m.group(1)
 
     except Exception as e:
-        st.error(f"⚠️ Error while extracting summary: {e}")
+        st.error(f"⚠️ Error extracting summary: {e}")
 
     if not summary:
         summary = {"Info": "No summary details detected in PDF."}
 
-    # Final numeric normalization
-    for k in list(summary.keys()):
-        # if numeric-like string, format
-        if isinstance(summary[k], (int, float)):
-            summary[k] = fmt_num(summary[k])
-        else:
-            mnum = re.match(r"^\s*[\d,]+(?:\.\d+)?\s*$", str(summary[k]))
-            if mnum:
-                try:
-                    summary[k] = fmt_num(str(summary[k]).replace(",", ""))
-                except:
-                    pass
-
     return summary
 
 # ------------------------------
-# Pretty Summary Cards (color-coded)
-# ------------------------------
-def display_summary(summary, account_name):
-    st.subheader(f"📋 Statement Summary for {account_name}")
-    st.json(summary)
-
-    def colored_card(label, value, color, icon=""):
-        return f"""
-        <div style="background:{color};padding:12px;border-radius:10px;margin:3px;text-align:center;color:white;font-weight:600;">
-            <div style="font-size:15px;">{icon} {label}</div>
-            <div style="font-size:18px;margin-top:6px;">{value}</div>
-        </div>
-        """
-
-    def try_float_str(s):
-        try:
-            return float(str(s).replace(",", ""))
-        except:
-            return 0.0
-
-    total_due_val = try_float_str(summary.get("Total Due", "0"))
-    min_due_val = try_float_str(summary.get("Minimum Due", "0"))
-    avail_credit_val = try_float_str(summary.get("Available Credit", "0"))
-
-    total_due_color = "#d9534f" if total_due_val > 0 else "#5cb85c"
-    min_due_color = "#f0ad4e" if min_due_val > 0 else "#5cb85c"
-    avail_credit_color = "#5bc0de" if avail_credit_val > 0 else "#d9534f"
-
-    col1, col2, col3 = st.columns(3)
-    col4, col5, col6 = st.columns(3)
-    col7, col8, col9 = st.columns(3)
-
-    with col1:
-        if summary.get("Statement Date"):
-            st.markdown(colored_card("📅 Statement Date", summary["Statement Date"], "#0275d8"), unsafe_allow_html=True)
-    with col2:
-        if summary.get("Payment Due Date"):
-            st.markdown(colored_card("⏰ Payment Due Date", summary["Payment Due Date"], "#5bc0de"), unsafe_allow_html=True)
-    with col3:
-        if summary.get("Previous Balance"):
-            st.markdown(colored_card("💳 Previous Balance", summary["Previous Balance"], "#6f42c1"), unsafe_allow_html=True)
-
-    with col4:
-        if summary.get("Total Due"):
-            st.markdown(colored_card("💰 Total Due", summary["Total Due"], total_due_color), unsafe_allow_html=True)
-    with col5:
-        if summary.get("Minimum Due"):
-            st.markdown(colored_card("⚠️ Minimum Due", summary["Minimum Due"], min_due_color), unsafe_allow_html=True)
-    with col6:
-        if summary.get("Credit Limit"):
-            st.markdown(colored_card("🏦 Credit Limit", summary["Credit Limit"], "#5cb85c"), unsafe_allow_html=True)
-
-    with col7:
-        if summary.get("Available Credit"):
-            st.markdown(colored_card("✅ Available Credit", summary["Available Credit"], avail_credit_color), unsafe_allow_html=True)
-    with col8:
-        if summary.get("Total Purchases"):
-            st.markdown(colored_card("🛒 Total Purchases", summary["Total Purchases"], "#0275d8"), unsafe_allow_html=True)
-    with col9:
-        if summary.get("Total Payments"):
-            st.markdown(colored_card("💵 Total Payments", summary["Total Payments"], "#20c997"), unsafe_allow_html=True)
-
-# ------------------------------
-# Categorize expenses (simple)
+# Categorize expenses
 # ------------------------------
 def categorize_expenses(df):
     df["Category"] = df["Merchant"].apply(get_category)
     return df
 
 # ------------------------------
-# Add new vendor (persist)
-# ------------------------------
-def add_new_vendor(merchant, category):
-    global vendor_map
-    new_row = pd.DataFrame([[merchant.lower(), category]], columns=["merchant", "category"])
-    vendor_map = pd.concat([vendor_map, new_row], ignore_index=True)
-    vendor_map.drop_duplicates(subset=["merchant"], keep="last", inplace=True)
-    vendor_map.to_csv(VENDOR_FILE, index=False)
-
-# ------------------------------
-# Export Helpers
-# ------------------------------
-def convert_df_to_csv(df):
-    df["Amount"] = df["Amount"].round(2)
-    return df.to_csv(index=False).encode("utf-8")
-
-def convert_df_to_excel(df):
-    df["Amount"] = df["Amount"].round(2)
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Expenses", float_format="%.2f")
-    processed_data = output.getvalue()
-    return processed_data
-
-# ------------------------------
 # Streamlit UI
 # ------------------------------
 st.title("💳 Multi-Account Expense Analyzer")
-st.write("✅ App loaded successfully, waiting for uploads...")
+st.write("Upload statements (PDF, CSV, or Excel) to view transactions + summary.")
 
 uploaded_files = st.file_uploader(
     "Upload Statements",
@@ -457,10 +169,8 @@ if uploaded_files:
                 df = extract_transactions_from_pdf(uploaded_file, account_name)
                 summary = extract_summary_from_pdf(uploaded_file)
 
-                # show summary and cards
                 st.subheader(f"📋 Statement Summary for {account_name}")
                 st.json(summary)
-                display_summary(summary, account_name)
 
             elif uploaded_file.name.endswith(".csv"):
                 df = pd.read_csv(uploaded_file)
@@ -474,35 +184,6 @@ if uploaded_files:
     if not all_data.empty:
         all_data = categorize_expenses(all_data)
         all_data["Amount"] = all_data["Amount"].round(2)
+
         st.subheader("📑 Extracted Transactions")
         st.dataframe(all_data.style.format({"Amount": "{:,.2f}"}))
-
-        # Unknown merchant handling
-        others_df = all_data[all_data["Category"] == "Others"]
-        if not others_df.empty:
-            st.subheader("⚡ Assign Categories for Unknown Merchants")
-            for merchant in others_df["Merchant"].unique():
-                category = st.selectbox(
-                    f"Select category for {merchant}:",
-                    ["Food", "Shopping", "Travel", "Utilities", "Entertainment", "Groceries", "Jewellery", "Healthcare", "Fuel", "Electronics", "Banking", "Insurance", "Education", "Others"],
-                    key=merchant
-                )
-                if category != "Others":
-                    add_new_vendor(merchant, category)
-                    all_data.loc[all_data["Merchant"] == merchant, "Category"] = category
-                    st.success(f"✅ {merchant} categorized as {category}")
-
-        st.subheader("📊 Expense Analysis")
-        st.write("💰 **Total Spent:**", f"{all_data['Amount'].sum():,.2f}")
-        st.bar_chart(all_data.groupby("Category")["Amount"].sum())
-        st.write("🏦 **Top 5 Merchants**")
-        st.dataframe(all_data.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head().apply(lambda x: f"{x:,.2f}"))
-        st.write("🏦 **Expense by Account**")
-        st.bar_chart(all_data.groupby("Account")["Amount"].sum())
-
-        # Export
-        csv_data = convert_df_to_csv(all_data)
-        excel_data = convert_df_to_excel(all_data)
-
-        st.download_button("⬇️ Download as CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
-        st.download_button("⬇️ Download as Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
