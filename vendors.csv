@@ -1,0 +1,190 @@
+merchant,category
+# ================= SHOPPING =================
+amazon,Shopping
+flipkart,Shopping
+myntra,Shopping
+ajio,Shopping
+nykaa,Shopping
+meesho,Shopping
+snapdeal,Shopping
+tatacliq,Shopping
+reliance trends,Shopping
+bigbasket,Shopping
+dmart,Shopping
+grofers,Shopping
+walmart,Shopping
+target,Shopping
+costco,Shopping
+ikea,Shopping
+best buy,Shopping
+croma,Shopping
+spencers,Shopping
+aliexpress,Shopping
+shein,Shopping
+zalando,Shopping
+asos,Shopping
+
+# ================= FOOD & DINING =================
+zomato,Food
+swiggy,Food
+dominos,Food
+pizza hut,Food
+kfc,Food
+mcdonald,Food
+burger king,Food
+starbucks,Food
+costa coffee,Food
+subway,Food
+dunkin,Food
+tim hortons,Food
+chipotle,Food
+taco bell,Food
+five guys,Food
+ubereats,Food
+doordash,Food
+grubhub,Food
+postmates,Food
+
+# ================= TRAVEL =================
+irctc,Travel
+ola,Travel
+uber,Travel
+rapido,Travel
+redbus,Travel
+indigo,Travel
+air india,Travel
+vistara,Travel
+go air,Travel
+spicejet,Travel
+makemytrip,Travel
+yatra,Travel
+cleartrip,Travel
+expedia,Travel
+tripadvisor,Travel
+booking.com,Travel
+airbnb,Travel
+delta airlines,Travel
+american airlines,Travel
+united airlines,Travel
+emirates,Travel
+qatar airways,Travel
+etihad,Travel
+singapore airlines,Travel
+british airways,Travel
+easyjet,Travel
+ryanair,Travel
+
+# ================= WALLETS & PAYMENT APPS =================
+paytm,Wallet
+phonepe,Wallet
+gpay,Wallet
+mobikwik,Wallet
+freecharge,Wallet
+paypal,Wallet
+venmo,Wallet
+cash app,Wallet
+revolut,Wallet
+wise,Wallet
+square,Wallet
+stripe,Wallet
+apple pay,Wallet
+samsung pay,Wallet
+
+# ================= UTILITIES =================
+airtel,Utilities
+jio,Utilities
+vi recharge,Utilities
+bsnl,Utilities
+electricity board,Utilities
+broadband,Utilities
+comcast,Utilities
+verizon,Utilities
+t-mobile,Utilities
+at&t,Utilities
+vodafone,Utilities
+water bill,Utilities
+gas bill,Utilities
+property tax,Utilities
+
+# ================= BANKING =================
+hdfc bank,Banking
+icici bank,Banking
+sbi,Banking
+axis bank,Banking
+kotak,Banking
+yes bank,Banking
+indusind,Banking
+federal bank,Banking
+idfc,Banking
+pnb,Banking
+boi,Banking
+canara bank,Banking
+union bank,Banking
+bob,Banking
+upi,Banking
+imps,Banking
+neft,Banking
+rtgs,Banking
+netbanking,Banking
+hsbc,Banking
+citibank,Banking
+bank of america,Banking
+chase,Banking
+wells fargo,Banking
+capital one,Banking
+american express,Banking
+barclays,Banking
+lloyds,Banking
+standard chartered,Banking
+deutsche bank,Banking
+dbs,Banking
+
+# ================= ENTERTAINMENT =================
+netflix,Entertainment
+prime video,Entertainment
+hotstar,Entertainment
+disney+,Entertainment
+sony liv,Entertainment
+aha,Entertainment
+voot,Entertainment
+spotify,Entertainment
+wynk,Entertainment
+gaana,Entertainment
+apple music,Entertainment
+youtube premium,Entertainment
+hulu,Entertainment
+hbo max,Entertainment
+paramount+,Entertainment
+zee5,Entertainment
+bookmyshow,Entertainment
+inox,Entertainment
+pvr,Entertainment
+
+# ================= INSURANCE =================
+insurance,Insurance
+lic,Insurance
+hdfc life,Insurance
+icici prudential,Insurance
+sbi life,Insurance
+max life,Insurance
+bajaj allianz,Insurance
+star health,Insurance
+tata aig,Insurance
+aegon,Insurance
+geico,Insurance
+state farm,Insurance
+progressive,Insurance
+allstate,Insurance
+aia,Insurance
+
+# ================= EDUCATION =================
+school fees,Education
+college fees,Education
+udemy,Education
+coursera,Education
+byjus,Education
+unacademy,Education
+edx,Education
+khan academy,Education
+skillshare,Education
+udacity,Education
