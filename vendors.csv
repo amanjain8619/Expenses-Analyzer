@@ -9,20 +9,38 @@ meesho,Shopping
 snapdeal,Shopping
 tatacliq,Shopping
 reliance trends,Shopping
-bigbasket,Shopping
-dmart,Shopping
-grofers,Shopping
-walmart,Shopping
-target,Shopping
-costco,Shopping
-ikea,Shopping
-best buy,Shopping
-croma,Shopping
-spencers,Shopping
-aliexpress,Shopping
-shein,Shopping
 zalando,Shopping
 asos,Shopping
+decathlon,Shopping
+shoppers stop,Shopping
+lifestyle,Shopping
+pantaloons,Shopping
+
+# ================= GROCERIES =================
+bigbasket,Groceries
+dmart,Groceries
+grofers,Groceries
+spencers,Groceries
+more,Groceries
+star bazaar,Groceries
+walmart,Groceries
+target,Groceries
+costco,Groceries
+aldi,Groceries
+metro cash and carry,Groceries
+reliance fresh,Groceries
+
+# ================= JEWELLERY =================
+tanishq,Jewellery
+kalyan jewellers,Jewellery
+pc jeweller,Jewellery
+malabar gold,Jewellery
+tribhovandas bhimji,Jewellery
+caratlane,Jewellery
+blue nile,Jewellery
+zales,Jewellery
+kay jewellers,Jewellery
+jared,Jewellery
 
 # ================= FOOD & DINING =================
 zomato,Food
@@ -44,6 +62,9 @@ ubereats,Food
 doordash,Food
 grubhub,Food
 postmates,Food
+freshmenu,Food
+behrouz biryani,Food
+wow momo,Food
 
 # ================= TRAVEL =================
 irctc,Travel
@@ -63,16 +84,8 @@ expedia,Travel
 tripadvisor,Travel
 booking.com,Travel
 airbnb,Travel
-delta airlines,Travel
-american airlines,Travel
-united airlines,Travel
-emirates,Travel
-qatar airways,Travel
-etihad,Travel
-singapore airlines,Travel
-british airways,Travel
-easyjet,Travel
-ryanair,Travel
+blablacar,Travel
+ixigo,Travel
 
 # ================= WALLETS & PAYMENT APPS =================
 paytm,Wallet
@@ -85,8 +98,8 @@ venmo,Wallet
 cash app,Wallet
 revolut,Wallet
 wise,Wallet
-square,Wallet
-stripe,Wallet
+amazon pay,Wallet
+bharatpe,Wallet
 apple pay,Wallet
 samsung pay,Wallet
 
@@ -97,14 +110,16 @@ vi recharge,Utilities
 bsnl,Utilities
 electricity board,Utilities
 broadband,Utilities
-comcast,Utilities
+tata power,Utilities
+torrent power,Utilities
+adani electricity,Utilities
+water bill,Utilities
+gas bill,Utilities
+property tax,Utilities
 verizon,Utilities
 t-mobile,Utilities
 at&t,Utilities
 vodafone,Utilities
-water bill,Utilities
-gas bill,Utilities
-property tax,Utilities
 
 # ================= BANKING =================
 hdfc bank,Banking
@@ -171,11 +186,12 @@ bajaj allianz,Insurance
 star health,Insurance
 tata aig,Insurance
 aegon,Insurance
+icici lombard,Insurance
+new india assurance,Insurance
 geico,Insurance
 state farm,Insurance
 progressive,Insurance
 allstate,Insurance
-aia,Insurance
 
 # ================= EDUCATION =================
 school fees,Education
@@ -188,3 +204,44 @@ edx,Education
 khan academy,Education
 skillshare,Education
 udacity,Education
+whitehat jr,Education
+upgrad,Education
+simplilearn,Education
+
+# ================= HEALTHCARE =================
+apollo pharmacy,Healthcare
+pharmeasy,Healthcare
+1mg,Healthcare
+netmeds,Healthcare
+medlife,Healthcare
+practo,Healthcare
+max hospital,Healthcare
+fortis,Healthcare
+apollo hospital,Healthcare
+aiims,Healthcare
+cleveland clinic,Healthcare
+mayo clinic,Healthcare
+
+# ================= FUEL =================
+indian oil,Fuel
+bharat petroleum,Fuel
+hpcl,Fuel
+shell,Fuel
+esso,Fuel
+total,Fuel
+petronas,Fuel
+
+# ================= ELECTRONICS =================
+croma,Electronics
+reliance digital,Electronics
+best buy,Electronics
+micro center,Electronics
+newegg,Electronics
+dell,Electronics
+hp,Electronics
+lenovo,Electronics
+asus,Electronics
+acer,Electronics
+apple store,Electronics
+mi store,Electronics
+samsung store,Electronics
