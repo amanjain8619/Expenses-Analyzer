@@ -59,17 +59,21 @@ def extract_transactions_from_pdf(pdf_file, account_name):
                     credit = row_data.get("credit") or row_data.get("deposit") or ""
 
                     if debit and str(debit).strip() not in ["", "NaN", "nan"]:
-                        amt = round(float(str(debit).replace(",", "")), 2)
-                        tr_type = "DR"
+                        try:
+                            amt = round(float(str(debit).replace(",", "")), 2)
+                            tr_type = "DR"
+                            transactions.append([date, merchant.strip(), amt, tr_type, account_name])
+                        except:
+                            continue
                     elif credit and str(credit).strip() not in ["", "NaN", "nan"]:
-                        amt = -round(float(str(credit).replace(",", "")), 2)
-                        tr_type = "CR"
-                    else:
-                        continue
+                        try:
+                            amt = -round(float(str(credit).replace(",", "")), 2)
+                            tr_type = "CR"
+                            transactions.append([date, merchant.strip(), amt, tr_type, account_name])
+                        except:
+                            continue
 
-                    transactions.append([date, merchant.strip(), amt, tr_type, account_name])
-
-            # 2️⃣ Fallback: regex parsing (HDFC-style free text)
+            # 2️⃣ Fallback: regex parsing (HDFC-style free text with optional time)
             else:
                 text = page.extract_text()
                 if not text:
@@ -77,7 +81,7 @@ def extract_transactions_from_pdf(pdf_file, account_name):
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
                 for line in lines:
                     match = re.match(
-                        r"(\d{2}/\d{2}/\d{4})[\s:]+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
+                        r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
                         line
                     )
                     if match:
