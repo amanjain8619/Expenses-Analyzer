@@ -36,35 +36,59 @@ def get_category(merchant):
     return "Others"
 
 # ------------------------------
-# Extract transactions from PDF (text-based only, robust CR/DR)
+# Extract transactions from PDF (supports HDFC + BoB)
 # ------------------------------
 def extract_transactions_from_pdf(pdf_file, account_name):
     transactions = []
     with pdfplumber.open(pdf_file) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if not text:
-                continue
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-            for line in lines:
-                # Match: date, merchant, amount, optional CR/DR variations
-                match = re.match(
-                    r"(\d{2}/\d{2}/\d{4})[\s:]+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
-                    line
-                )
-                if match:
-                    date, merchant, amount, drcr, _ = match.groups()
-                    amt = round(float(amount.replace(",", "")), 2)
+            # 1️⃣ Try table extraction (BoB-style)
+            table = page.extract_table()
+            if table:
+                headers = [str(h).strip().lower() for h in table[0]]
+                for row in table[1:]:
+                    if not any(row):
+                        continue
+                    row_data = dict(zip(headers, row))
 
-                    # Decide Debit/Credit
-                    if drcr and drcr.strip().lower().startswith("cr"):
-                        amt = -amt
+                    date = row_data.get("date") or row_data.get("txn date") or row_data.get("transaction date")
+                    merchant = row_data.get("description") or row_data.get("narration") or ""
+
+                    debit = row_data.get("debit") or row_data.get("withdrawal") or ""
+                    credit = row_data.get("credit") or row_data.get("deposit") or ""
+
+                    if debit and str(debit).strip() not in ["", "NaN", "nan"]:
+                        amt = round(float(str(debit).replace(",", "")), 2)
+                        tr_type = "DR"
+                    elif credit and str(credit).strip() not in ["", "NaN", "nan"]:
+                        amt = -round(float(str(credit).replace(",", "")), 2)
                         tr_type = "CR"
                     else:
-                        tr_type = "DR"
+                        continue
 
                     transactions.append([date, merchant.strip(), amt, tr_type, account_name])
+
+            # 2️⃣ Fallback: regex parsing (HDFC-style free text)
+            else:
+                text = page.extract_text()
+                if not text:
+                    continue
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                for line in lines:
+                    match = re.match(
+                        r"(\d{2}/\d{2}/\d{4})[\s:]+(.+?)\s+([\d,]+\.\d{2})(\s?(Cr|CR|DR|Dr|CREDIT|DEBIT))?$",
+                        line
+                    )
+                    if match:
+                        date, merchant, amount, drcr, _ = match.groups()
+                        amt = round(float(amount.replace(",", "")), 2)
+                        if drcr and drcr.strip().lower().startswith("cr"):
+                            amt = -amt
+                            tr_type = "CR"
+                        else:
+                            tr_type = "DR"
+                        transactions.append([date, merchant.strip(), amt, tr_type, account_name])
 
             st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
 
