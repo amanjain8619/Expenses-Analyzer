@@ -68,31 +68,65 @@ def extract_transactions_from_pdf(pdf_file, account_name):
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
 # ------------------------------
-# Extract summary from PDF (HDFC + BoB style)
+# Extract summary from PDF (multi-bank support)
 # ------------------------------
 def extract_summary_from_pdf(pdf_file):
     summary = {}
+    text_all = ""
+
+    # Read first 3 pages (HDFC uses page 1, BoB often page 2)
     with pdfplumber.open(pdf_file) as pdf:
-        first_page_text = pdf.pages[0].extract_text()
-        if not first_page_text:
-            return summary
+        for i in range(min(3, len(pdf.pages))):
+            page_text = pdf.pages[i].extract_text()
+            if page_text:
+                text_all += "\n" + page_text
 
-        patterns = {
-            "Statement Date": r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-            "Payment Due Date": r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-            "Previous Balance": r"Previous Balance\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Total Due": r"(?:Total Amount Due|Total Due)\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Minimum Due": r"(?:Minimum Amount Due|Minimum Due)\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Total Purchases": r"(?:Total Purchases|Total Debit)\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Total Payments": r"(?:Total Payments|Total Credit)\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Credit Limit": r"(?:Credit Limit|Total Credit Limit)\s*[:\-]?\s*([\d,]+\.\d{2})",
-            "Available Credit": r"(?:Available Credit Limit|Available Credit)\s*[:\-]?\s*([\d,]+\.\d{2})",
-        }
+    if not text_all:
+        return summary
 
-        for key, pattern in patterns.items():
-            m = re.search(pattern, first_page_text, re.IGNORECASE)
+    # Expanded regex patterns
+    patterns = {
+        "Statement Date": [
+            r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+            r"Stmt Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})"
+        ],
+        "Payment Due Date": [
+            r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+            r"Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})"
+        ],
+        "Previous Balance": [
+            r"Previous Balance\s*[:\-]?\s*([\d,]+\.\d{2})",
+            r"Opening Balance\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Total Due": [
+            r"(?:Total Amount Due|Total Due)\s*[:\-]?\s*([\d,]+\.\d{2})",
+            r"Amount Due\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Minimum Due": [
+            r"(?:Minimum Amount Due|Minimum Due)\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Total Purchases": [
+            r"(?:Total Purchases|Total Debit|Purchases and Other Debits)\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Total Payments": [
+            r"(?:Total Payments|Total Credit|Payments and Other Credits)\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Credit Limit": [
+            r"(?:Credit Limit|Total Credit Limit)\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+        "Available Credit": [
+            r"(?:Available Credit Limit|Available Credit|Avail\. Credit)\s*[:\-]?\s*([\d,]+\.\d{2})"
+        ],
+    }
+
+    for key, regex_list in patterns.items():
+        for pattern in regex_list:
+            m = re.search(pattern, text_all, re.IGNORECASE)
             if m:
                 summary[key] = m.group(1).replace(",", "")
+                break
+        if key not in summary:  # fallback
+            summary[key] = "-"
 
     return summary
 
@@ -208,9 +242,11 @@ def display_summary(summary, account_name):
         </div>
         """
 
-    total_due_val = float(summary.get("Total Due", "0") or 0)
-    min_due_val = float(summary.get("Minimum Due", "0") or 0)
-    avail_credit_val = float(summary.get("Available Credit", "0") or 0)
+    try_float = lambda v: float(v) if v.replace(".", "", 1).isdigit() else 0.0
+
+    total_due_val = try_float(summary.get("Total Due", "0"))
+    min_due_val = try_float(summary.get("Minimum Due", "0"))
+    avail_credit_val = try_float(summary.get("Available Credit", "0"))
 
     total_due_color = "#d9534f" if total_due_val > 0 else "#5cb85c"
     min_due_color = "#f0ad4e" if min_due_val > 0 else "#5cb85c"
@@ -221,33 +257,33 @@ def display_summary(summary, account_name):
     col7, col8, col9 = st.columns(3)
 
     with col1:
-        if "Statement Date" in summary:
+        if summary.get("Statement Date", "-") != "-":
             st.markdown(colored_card("Statement Date", summary["Statement Date"], "#0275d8", "📅"), unsafe_allow_html=True)
     with col2:
-        if "Payment Due Date" in summary:
+        if summary.get("Payment Due Date", "-") != "-":
             st.markdown(colored_card("Payment Due Date", summary["Payment Due Date"], "#5bc0de", "⏰"), unsafe_allow_html=True)
     with col3:
-        if "Previous Balance" in summary:
+        if summary.get("Previous Balance", "-") != "-":
             st.markdown(colored_card("Previous Balance", f"{float(summary['Previous Balance']):,.2f}", "#6f42c1", "💳"), unsafe_allow_html=True)
 
     with col4:
-        if "Total Due" in summary:
+        if summary.get("Total Due", "-") != "-":
             st.markdown(colored_card("Total Due", f"{total_due_val:,.2f}", total_due_color, "💰"), unsafe_allow_html=True)
     with col5:
-        if "Minimum Due" in summary:
+        if summary.get("Minimum Due", "-") != "-":
             st.markdown(colored_card("Minimum Due", f"{min_due_val:,.2f}", min_due_color, "⚠️"), unsafe_allow_html=True)
     with col6:
-        if "Credit Limit" in summary:
+        if summary.get("Credit Limit", "-") != "-":
             st.markdown(colored_card("Credit Limit", f"{float(summary['Credit Limit']):,.2f}", "#5cb85c", "🏦"), unsafe_allow_html=True)
 
     with col7:
-        if "Available Credit" in summary:
+        if summary.get("Available Credit", "-") != "-":
             st.markdown(colored_card("Available Credit", f"{avail_credit_val:,.2f}", avail_credit_color, "✅"), unsafe_allow_html=True)
     with col8:
-        if "Total Purchases" in summary:
+        if summary.get("Total Purchases", "-") != "-":
             st.markdown(colored_card("Total Purchases", f"{float(summary['Total Purchases']):,.2f}", "#0275d8", "🛒"), unsafe_allow_html=True)
     with col9:
-        if "Total Payments" in summary:
+        if summary.get("Total Payments", "-") != "-":
             st.markdown(colored_card("Total Payments", f"{float(summary['Total Payments']):,.2f}", "#20c997", "💵"), unsafe_allow_html=True)
 
 # ==============================
@@ -276,13 +312,10 @@ if uploaded_files:
                     display_summary(summary, account_name)
             elif uploaded_file.name.endswith(".csv"):
                 df = extract_transactions_from_csv(uploaded_file, account_name)
-                summary = {}
             elif uploaded_file.name.endswith(".xlsx"):
                 df = extract_transactions_from_excel(uploaded_file, account_name)
-                summary = {}
             else:
                 df = pd.DataFrame()
-                summary = {}
 
             all_data = pd.concat([all_data, df], ignore_index=True)
 
