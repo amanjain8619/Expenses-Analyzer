@@ -44,45 +44,38 @@ def map_four_numbers(nums, summary_exists=False):
     fields_primary = ["Credit Limit", "Available Credit", "Total Due", "Minimum Due"]
     fields_secondary = ["Total Payments", "Other Charges", "Total Purchases", "Previous Balance"]
 
-    # Try default ordering first
-    default_map = dict(zip(fields_secondary if summary_exists else fields_primary, nums))
     # Constraint check function
-    def valid_map(m):
-        # require credit limit >= available and minimum <= total_due
+    def valid_primary_map(m):
         cl = m.get("Credit Limit")
         av = m.get("Available Credit")
         td = m.get("Total Due")
         md = m.get("Minimum Due")
-        # If credit limit present check
         if cl is not None and av is not None:
             if cl + 1e-6 < av:
                 return False
-        if td is not None and cl is not None:
-            # total due usually <= credit limit (but can exceed if overlimit) -- be lenient
-            if td > cl * 3 and cl > 0:
-                return False
-        if md is not None and td is not None:
+        if td is not None and md is not None:
             if md - td > 1e-6:  # minimum should be <= total
                 return False
         return True
 
     if not summary_exists:
-        # check default mapping
+        # try default ordering first
         m0 = dict(zip(fields_primary, nums))
-        if valid_map(m0):
+        if valid_primary_map(m0):
             return {k: f"{v:,.2f}" for k, v in m0.items()}
+
         # try permutations of mapping positions to fields
-        best = None
         candidates = []
         for perm in itertools.permutations(range(4)):
             m = {fields_primary[i]: nums[perm[i]] for i in range(4)}
-            if valid_map(m):
+            if valid_primary_map(m):
                 candidates.append(m)
         if candidates:
-            # choose the candidate with largest credit limit (most likely correct)
+            # choose the candidate with largest Credit Limit
             best = max(candidates, key=lambda x: x.get("Credit Limit", 0) or 0)
             return {k: f"{v:,.2f}" for k, v in best.items()}
-        # fallback: pick max as credit limit, min as minimum, rest by descending
+
+        # fallback: assume descending order: credit, available, total, minimum
         sorted_nums = sorted(nums, reverse=True)
         fallback = {
             "Credit Limit": sorted_nums[0],
@@ -94,7 +87,7 @@ def map_four_numbers(nums, summary_exists=False):
     else:
         # secondary row mapping (payments etc.)
         m0 = dict(zip(fields_secondary, nums))
-        # Basic sanity checks: Total Payments & Total Purchases should be non-negative
+        # Basic sanity checks: values should be non-negative
         if all(v >= 0 for v in nums):
             return {k: f"{v:,.2f}" for k, v in m0.items()}
         # try permutations
@@ -166,6 +159,7 @@ def extract_transactions_from_pdf(pdf_file, account_name):
 def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
+    numeric_rows_collected = []  # list of (nums_list, page_idx, row_idx, raw_row_text)
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
@@ -176,74 +170,96 @@ def extract_summary_from_pdf(pdf_file):
                     text_all += "\n" + page_text
 
                 tables = page.extract_tables() or []
-                for table in tables:
+                for t_idx, table in enumerate(tables):
                     if not table or len(table) == 0:
                         continue
 
                     # Normalize rows (strip)
                     rows = [[(str(cell).strip() if cell is not None else "") for cell in r] for r in table]
 
-                    # 1) If first or second row contains header keywords, map header->value using next row(s)
+                    # 1) Header->value mapping only when the value row contains at least one numeric token
                     header_keywords = ["due", "total", "payment", "credit limit", "available", "purchase", "opening", "minimum", "payments", "purchases"]
-                    header_row_idx = None
+                    # Look for header rows in first two rows
                     for ridx in range(min(2, len(rows))):
                         row_text = " ".join(rows[ridx]).lower()
-                        if any(k in row_text for k in header_keywords):
-                            header_row_idx = ridx
-                            break
-                    if header_row_idx is not None and header_row_idx + 1 < len(rows):
-                        headers = rows[header_row_idx]
-                        values = rows[header_row_idx + 1]
-                        # zip headers->values
-                        for h, v in zip(headers, values):
-                            if not v or v.lower() in ["nan", ""]:
-                                continue
-                            h_low = h.lower()
-                            v_clean = v.replace(",", "")
-                            # map header text heuristically
-                            if "payment due" in h_low or "due date" in h_low or "payment due date" in h_low:
-                                summary["Payment Due Date"] = v_clean
-                            elif "statement date" in h_low or "statement" in h_low and "date" in h_low:
-                                summary["Statement Date"] = v_clean
-                            elif "total dues" in h_low or "total due" in h_low or "total dues" in h_low:
-                                summary["Total Due"] = fmt_num(v_clean)
-                            elif "minimum" in h_low:
-                                summary["Minimum Due"] = fmt_num(v_clean)
-                            elif "credit limit" in h_low and "available" not in h_low:
-                                summary["Credit Limit"] = fmt_num(v_clean)
-                            elif "available credit" in h_low or "available credit limit" in h_low:
-                                summary["Available Credit"] = fmt_num(v_clean)
-                            elif "available cash" in h_low:
-                                summary["Available Cash"] = fmt_num(v_clean)
-                            elif "opening balance" in h_low:
-                                summary["Previous Balance"] = fmt_num(v_clean)
-                            elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip():
-                                summary["Total Payments"] = fmt_num(v_clean)
-                            elif "purchase" in h_low or "debit" in h_low:
-                                summary["Total Purchases"] = fmt_num(v_clean)
-                            elif "finance" in h_low:
-                                summary["Finance Charges"] = fmt_num(v_clean)
-                        # continue to next table after header mapping
-                        continue
+                        if any(k in row_text for k in header_keywords) and (ridx + 1) < len(rows):
+                            values_row = rows[ridx + 1]
+                            # ensure values_row has at least one numeric token
+                            numbers_in_values = re.findall(r"[\d,]+\.\d{2}", " ".join(values_row))
+                            if not numbers_in_values:
+                                continue  # skip header mapping if next row is non-numeric
+                            headers = rows[ridx]
+                            values = values_row
+                            # map headers->values but only where value is numeric
+                            for h, v in zip(headers, values):
+                                if not v:
+                                    continue
+                                v_nums = re.findall(r"[\d,]+\.\d{2}", v)
+                                v_clean = v.replace(",", "")
+                                h_low = h.lower()
+                                if v_nums:
+                                    if "payment due" in h_low or "due date" in h_low or "payment due date" in h_low:
+                                        summary["Payment Due Date"] = v_clean
+                                    elif "statement date" in h_low:
+                                        summary["Statement Date"] = v_clean
+                                    elif "total dues" in h_low or "total due" in h_low:
+                                        summary["Total Due"] = fmt_num(v_clean)
+                                    elif "minimum" in h_low:
+                                        summary["Minimum Due"] = fmt_num(v_clean)
+                                    elif "credit limit" in h_low and "available" not in h_low:
+                                        summary["Credit Limit"] = fmt_num(v_clean)
+                                    elif "available credit" in h_low or "available credit limit" in h_low:
+                                        summary["Available Credit"] = fmt_num(v_clean)
+                                    elif "available cash" in h_low:
+                                        summary["Available Cash"] = fmt_num(v_clean)
+                                    elif "opening balance" in h_low:
+                                        summary["Previous Balance"] = fmt_num(v_clean)
+                                    elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip():
+                                        summary["Total Payments"] = fmt_num(v_clean)
+                                    elif "purchase" in h_low or "debit" in h_low:
+                                        summary["Total Purchases"] = fmt_num(v_clean)
+                                    elif "finance" in h_low:
+                                        summary["Finance Charges"] = fmt_num(v_clean)
+                            # after header mapping continue to next table
+                            continue
 
-                    # 2) Otherwise look for ANY rows that contain exactly 4 numeric values (BoB-like)
-                    numeric_rows = []
-                    for r in rows:
-                        # flatten row into string and find all numbers
-                        numbers = re.findall(r"[\d,]+\.\d{2}", " ".join(r))
+                    # 2) Collect any rows with exactly 4 numeric values (BoB-like)
+                    for ridx, r in enumerate(rows):
+                        row_text = " ".join(r)
+                        numbers = re.findall(r"[\d,]+\.\d{2}", row_text)
                         if len(numbers) == 4:
-                            numeric_rows.append([n.replace(",", "") for n in numbers])
+                            nums_clean = [n.replace(",", "") for n in numbers]
+                            nums_float = []
+                            ok = True
+                            for n in nums_clean:
+                                try:
+                                    nums_float.append(float(n))
+                                except:
+                                    ok = False
+                                    break
+                            if ok:
+                                numeric_rows_collected.append((nums_float, i, t_idx, ridx, row_text))
 
-                    # Process numeric rows in order found: first maps to credit-info if not present
-                    for nr_idx, nr in enumerate(numeric_rows):
-                        nums = [float(x) for x in nr]
-                        mapped = map_four_numbers(nums, summary_exists=bool(summary.get("Credit Limit")))
-                        # merge mapped fields into summary (do not overwrite existing keys)
-                        for k, v in mapped.items():
-                            if k not in summary:
-                                summary[k] = v
+        # If numeric rows found, pick primary row as one with largest max value (credit info)
+        if numeric_rows_collected:
+            # sort by max value descending
+            numeric_rows_collected_sorted = sorted(numeric_rows_collected, key=lambda x: max(x[0]) if x[0] else 0, reverse=True)
+            # primary
+            primary = numeric_rows_collected_sorted[0][0]
+            mapped_primary = map_four_numbers(primary, summary_exists=bool(summary.get("Credit Limit")))
+            # merge primary
+            for k, v in mapped_primary.items():
+                if k not in summary:
+                    summary[k] = v
+            # remaining rows -> map as secondary if any
+            for other in numeric_rows_collected_sorted[1:]:
+                nums = other[0]
+                mapped_secondary = map_four_numbers(nums, summary_exists=True)
+                for k, v in mapped_secondary.items():
+                    if k not in summary:
+                        summary[k] = v
 
-        # Regex fallback for Statement Date and minimal other fields if missing
+        # Regex fallback for Statement Date if still missing
         if "Statement Date" not in summary:
             patterns = [
                 r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
@@ -263,8 +279,17 @@ def extract_summary_from_pdf(pdf_file):
 
     # Ensure numeric fields formatted
     for k in list(summary.keys()):
+        # if the value looks like a number without comma formatting, attempt to format
         if isinstance(summary[k], (int, float)):
             summary[k] = fmt_num(summary[k])
+        else:
+            # if it's numeric string, standardize it
+            mnum = re.match(r"^\s*[\d,]+(?:\.\d+)?\s*$", str(summary[k]))
+            if mnum:
+                try:
+                    summary[k] = fmt_num(str(summary[k]).replace(",", ""))
+                except:
+                    pass
 
     return summary
 
@@ -393,8 +418,6 @@ if uploaded_files:
 
             elif uploaded_file.name.endswith(".csv"):
                 df = pd.read_csv(uploaded_file)
-                # normalization left simple here
-                df = df.rename(columns={c: c for c in df.columns})
             elif uploaded_file.name.endswith(".xlsx"):
                 df = pd.read_excel(uploaded_file)
             else:
