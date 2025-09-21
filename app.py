@@ -109,36 +109,31 @@ def extract_transactions_from_pdf(pdf_file, account_name, debug=False):
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
 
                 if "American Express" in text:
-                    # Multi-line parsing for AMEX
-                    try:
-                        i = lines.index("Amount Rs") + 1
-                    except ValueError:
-                        i = 0
-
+                    # Updated parsing for AMEX
+                    i = 0
                     while i < len(lines):
-                        if re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]):
-                            date_str = lines[i]
-                            i += 1
-                            merchant = ""
-                            while i < len(lines) and not re.match(r"^[\d,]+\.\d{2}$", lines[i]) and lines[i] != "CR" and not re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]):
-                                if "Card Number" not in lines[i]:
-                                    merchant += lines[i] + " "
-                                i += 1
-                            if i >= len(lines) or not re.match(r"^[\d,]+\.\d{2}$", lines[i]):
-                                continue
-                            amount_str = lines[i]
-                            amt = float(amount_str.replace(",", ""))
+                        line = lines[i]
+                        m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+(?:([\d,]+\.\d{2})\s+)?([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
+                        if m:
+                            date_str, merchant, foreign, amount, cr_suffix = m.groups()
+                            if foreign:
+                                amt_str = amount
+                            else:
+                                amt_str = foreign if foreign else amount  # But since foreign None, use amount
+                            amt = float(amt_str.replace(",", ""))
                             drcr = "DR"
-                            i += 1
-                            while i < len(lines) and not re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]) and not re.match(r"^[\d,]+\.\d{2}$", lines[i]):
-                                if lines[i] == "CR":
-                                    drcr = "CR"
-                                    amt = -amt
-                                # else skip
-                                i += 1
+                            if cr_suffix:
+                                amt = -amt
+                                drcr = "CR"
+                            else:
+                                # Special case for payment received
+                                if "PAYMENT RECEIVED" in merchant.upper():
+                                    if i + 1 < len(lines) and "CR" in lines[i + 1].upper():
+                                        amt = -amt
+                                        drcr = "CR"
+                                        i += 1  # Skip the Card Number line
                             transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
-                        else:
-                            i += 1
+                        i += 1
                 else:
                     # Single-line parsing for other banks
                     for line in lines:
