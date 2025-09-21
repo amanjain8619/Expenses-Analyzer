@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 # ==============================
-# Load vendor mapping
+# Vendor Mapping
 # ==============================
 VENDOR_FILE = "vendors.csv"
 
@@ -21,9 +21,9 @@ else:
 # ------------------------------
 # Helpers
 # ------------------------------
-def fmt_num(val):
+def fmt_currency(val):
     try:
-        return f"{float(str(val).replace(',', '').strip()):,.2f}"
+        return "₹{:,.2f}".format(float(val))
     except:
         return val
 
@@ -34,58 +34,52 @@ def parse_number(s):
         return None
 
 def parse_date(date_str):
-    """Handle dd/mm/yyyy, Month DD, DD Month formats."""
     date_str = date_str.replace(",", "").strip()
-    try:
-        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%d/%m/%Y")
-    except:
-        for fmt in ["%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y", "%B %d", "%b %d"]:
-            try:
-                d = datetime.strptime(date_str, fmt)
-                d = d.replace(year=datetime.today().year)
-                return d.strftime("%d/%m/%Y")
-            except:
-                pass
-        return date_str
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"]:
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%d/%m/%Y")
+        except:
+            pass
+    return date_str
 
 # ------------------------------
-# Fuzzy matching to find category
+# Fuzzy Category Matching
 # ------------------------------
 def get_category(merchant):
     m = str(merchant).lower()
     try:
-        matches = process.extractOne(
-            m,
-            vendor_map["merchant"].str.lower().tolist(),
-            score_cutoff=80
-        )
+        matches = process.extractOne(m, vendor_map["merchant"].str.lower().tolist(), score_cutoff=80)
     except Exception:
         return "Others"
     if matches:
         matched_merchant = matches[0]
-        category = vendor_map.loc[
-            vendor_map["merchant"].str.lower() == matched_merchant, "category"
-        ].iloc[0]
+        category = vendor_map.loc[vendor_map["merchant"].str.lower() == matched_merchant, "category"].iloc[0]
         return category
     return "Others"
 
 # ------------------------------
-# Extract transactions from PDF
+# PDF Transaction Extractor
 # ------------------------------
 def extract_transactions_from_pdf(pdf_file, account_name):
     transactions = []
+    text_all = ""
     is_amex = False
+
     with pdfplumber.open(pdf_file) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
             text = page.extract_text()
+            if text:
+                text_all += text + "\n"
+                if "American Express" in text:
+                    is_amex = True
+
             if not text:
                 continue
-            if "American Express" in text:
-                is_amex = True
+
             lines = [l.strip() for l in text.split("\n") if l.strip()]
 
             if not is_amex:
-                # HDFC / ICICI / BoB style
+                # Generic bank parsing
                 for line in lines:
                     match = re.match(
                         r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?",
@@ -93,33 +87,32 @@ def extract_transactions_from_pdf(pdf_file, account_name):
                     )
                     if match:
                         date, merchant, amount, drcr = match.groups()
-                        try:
-                            amt = round(float(amount.replace(",", "")), 2)
-                        except:
-                            continue
+                        amt = float(amount.replace(",", ""))
                         if drcr and drcr.strip().lower().startswith("cr"):
                             amt = -amt
                             tr_type = "CR"
                         else:
                             tr_type = "DR"
-                        transactions.append([parse_date(date), merchant.strip(), amt, tr_type, account_name])
+                        transactions.append([parse_date(date), merchant.strip(), round(amt, 2), tr_type, account_name])
             else:
-                # AMEX style
+                # AMEX parsing
                 i = 0
                 while i < len(lines):
                     line = lines[i]
-                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})$", line)
+                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+(?:([\d,]+\.\d{2})\s+)?([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
                     if m:
-                        date_str, merchant, amount = m.groups()
-                        try:
-                            amt = float(amount.replace(",", ""))
-                        except:
-                            i += 1
-                            continue
+                        date_str, merchant, foreign, amount, cr_suffix = m.groups()
+                        amt_str = foreign if foreign else amount
+                        amt = float(amt_str.replace(",", ""))
                         drcr = "DR"
-                        if "PAYMENT RECEIVED" in merchant.upper() or "CR" in line.upper() or "CREDIT" in line.upper():
+                        if cr_suffix:
                             amt = -amt
                             drcr = "CR"
+                        elif "PAYMENT RECEIVED" in merchant.upper():
+                            if i + 1 < len(lines) and "CR" in lines[i + 1].upper():
+                                amt = -amt
+                                drcr = "CR"
+                                i += 1
                         transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
                     i += 1
 
@@ -128,11 +121,12 @@ def extract_transactions_from_pdf(pdf_file, account_name):
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
 # ------------------------------
-# Extract summary from PDF
+# Summary Extractor (robust)
 # ------------------------------
 def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
+    debug_matches = []
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
@@ -143,61 +137,45 @@ def extract_summary_from_pdf(pdf_file):
 
         text_all = re.sub(r"\s+", " ", text_all)
 
-        # --- AMEX style ---
-        amex_patterns = {
-            "Total Limit": r"Credit Limit\s*Rs\.?\s*([\d,]+\.\d{2})",
-            "Used Limit": r"Closing Balance\s*Rs\.?\s*([\d,]+\.\d{2})",
-            "Available Credit Limit": r"Available Credit Limit\s*Rs\.?\s*([\d,]+\.\d{2})",
-            "Statement date": r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-            "Payment Due Date": r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+        patterns = {
+            "Total Limit": r"(Credit Limit|Sanctioned Credit Limit)\s*[:\-]?\s*Rs?\.?\s*([\d,]+\.?\d*)",
+            "Available Credit Limit": r"(Available Credit Limit)\s*[:\-]?\s*Rs?\.?\s*([\d,]+\.?\d*)",
+            "Used Limit": r"(Closing Balance|Total Due|Total Dues|Outstanding Balance)\s*[:\-]?\s*Rs?\.?\s*([\d,]+\.?\d*)",
+            "Statement date": r"(Statement Date|Statement Period.*?to)\s*[:\-]?\s*([0-9]{1,2}[ /-][A-Za-z0-9]+[ /-][0-9]{2,4})",
+            "Payment Due Date": r"(Payment Due Date|Due by)\s*[:\-]?\s*([0-9]{1,2}[ /-][A-Za-z0-9]+[ /-][0-9]{2,4})",
         }
 
-        # --- HDFC / ICICI style ---
-        hdfc_patterns = {
-            "Total Limit": r"Credit Limit\s*[:\- ]?\s*([\d,]+)",
-            "Available Credit Limit": r"Available Credit Limit\s*[:\- ]?\s*([\d,]+)",
-            "Used Limit": r"Total Dues\s*[:\- ]?\s*([\d,]+)",
-            "Statement date": r"Statement Date\s*[:\- ]?\s*(\d{2}/\d{2}/\d{4})",
-            "Payment Due Date": r"Payment Due Date\s*[:\- ]?\s*(\d{2}/\d{2}/\d{4})",
-        }
-
-        # --- BoB style ---
-        bob_patterns = {
-            "Total Limit": r"Sanctioned Credit Limit\s*[:\- ]?\s*([\d,]+\.\d{2})",
-            "Available Credit Limit": r"Available Credit Limit\s*[:\- ]?\s*([\d,]+\.\d{2})",
-            "Used Limit": r"(Closing Balance|Total Due)\s*[:\- ]?\s*([\d,]+\.\d{2})",
-            "Statement date": r"Statement Period\s*From\s*.*?\s*to\s*(\d{2}\s+\w+\s+\d{4})",
-            "Payment Due Date": r"Payment Due Date\s*[:\- ]?\s*(\d{2}/\d{2}/\d{4})",
-        }
-
-        if "American Express" in text_all:
-            chosen = amex_patterns
-        elif "HDFC Bank" in text_all or "ICICI Bank" in text_all:
-            chosen = hdfc_patterns
-        elif "BOB" in text_all or "Bank of Baroda" in text_all:
-            chosen = bob_patterns
-        else:
-            chosen = {**amex_patterns, **hdfc_patterns, **bob_patterns}
-
-        for field, pat in chosen.items():
+        for field, pat in patterns.items():
             m = re.search(pat, text_all, re.IGNORECASE)
             if m:
-                val = next((g for g in m.groups() if g), None)
-                if val:
-                    summary[field] = fmt_num(val)
+                raw_line = m.group(0)
+                val = m.group(len(m.groups()))
+                if field in ["Statement date", "Payment Due Date"]:
+                    summary[field] = parse_date(val)
+                else:
+                    num_val = parse_number(val)
+                    if num_val is not None:
+                        summary[field] = round(num_val, 2)
+                debug_matches.append(f"{field}: '{raw_line}' ➝ {summary.get(field)}")
 
-        # Expenses
-        m = re.search(r"Total Purchases\s*[:\- ]?\s*([\d,]+\.\d{2})|Purchases/ Debits\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
+        m = re.search(r"(Total Purchases|Purchases/ Debits|New Purchases)\s*[:\-]?\s*([\d,]+\.?\d*)", text_all, re.IGNORECASE)
         if m:
-            val = next((g for g in m.groups() if g), None)
-            if val:
-                summary["Expenses during the month"] = fmt_num(val)
+            num_val = parse_number(m.group(2))
+            if num_val is not None:
+                summary["Expenses during the month"] = round(num_val, 2)
+                debug_matches.append(f"Expenses: '{m.group(0)}' ➝ {summary['Expenses during the month']}")
 
-        return summary if summary else {"Info": "No summary details detected"}
+        if not summary:
+            return {"Info": "No summary details detected in PDF."}
+
+        with st.expander("🔎 Debug Matches"):
+            for line in debug_matches:
+                st.write(line)
+
+        return summary
 
     except Exception as e:
-        st.error(f"⚠️ Error extracting summary: {e}")
-        return {"Info": "No summary details detected"}
+        return {"Error": str(e)}
 
 # ------------------------------
 # Display Summary Cards
@@ -206,6 +184,8 @@ def display_summary(summary, account_name):
     st.subheader(f"📋 Statement Summary for {account_name}")
 
     def colored_card(label, value, color, icon=""):
+        if isinstance(value, (int, float)):
+            value = fmt_currency(value)
         return f"""
         <div style="background:{color};padding:12px;border-radius:10px;margin:3px;text-align:center;color:white;font-weight:600;">
             <div style="font-size:15px;">{icon} {label}</div>
@@ -230,7 +210,7 @@ def display_summary(summary, account_name):
         st.markdown(colored_card("🛒 Expenses during the month", summary.get("Expenses during the month", "N/A"), "#0275d8"), unsafe_allow_html=True)
 
 # ------------------------------
-# CSV/XLSX Extractors
+# CSV / Excel Extraction
 # ------------------------------
 def extract_transactions_from_excel(file, account_name):
     df = pd.read_excel(file)
@@ -242,18 +222,16 @@ def extract_transactions_from_csv(file, account_name):
 
 def normalize_dataframe(df, account_name):
     col_map = {
-        "date": "Date",
-        "transaction date": "Date",
-        "txn date": "Date",
-        "description": "Merchant",
-        "narration": "Merchant",
-        "merchant": "Merchant",
-        "amount": "Amount",
-        "debit": "Debit",
-        "credit": "Credit",
-        "type": "Type"
+        "date": "Date", "transaction date": "Date", "txn date": "Date",
+        "description": "Merchant", "narration": "Merchant", "merchant": "Merchant",
+        "amount": "Amount", "debit": "Debit", "credit": "Credit", "type": "Type"
     }
-    df = df.rename(columns={c: col_map[c.lower().strip()] for c in df.columns if c.lower().strip() in col_map})
+    df_renamed = {}
+    for col in df.columns:
+        key = col.lower().strip()
+        if key in col_map:
+            df_renamed[col] = col_map[key]
+    df = df.rename(columns=df_renamed)
 
     if "Debit" in df and "Credit" in df:
         df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
@@ -272,7 +250,7 @@ def normalize_dataframe(df, account_name):
     return df[["Date", "Merchant", "Amount", "Type", "Account"]]
 
 # ------------------------------
-# Categorize expenses
+# Categorize Expenses
 # ------------------------------
 def categorize_expenses(df):
     df["Category"] = df["Merchant"].apply(get_category)
@@ -333,29 +311,34 @@ if uploaded_files:
         st.subheader("📑 Extracted Transactions")
         st.dataframe(all_data.style.format({"Amount": "{:,.2f}"}))
 
+        # Unknown merchant categorization
         others_df = all_data[all_data["Category"] == "Others"]
         if not others_df.empty:
             st.subheader("⚡ Assign Categories for Unknown Merchants")
             for merchant in others_df["Merchant"].unique():
-                category = st.selectbox(
-                    f"Select category for {merchant}:",
-                    ["Food","Shopping","Travel","Utilities","Entertainment","Groceries","Jewellery","Healthcare","Fuel","Electronics","Banking","Insurance","Education","Others"],
-                    key=merchant
-                )
+                category = st.selectbox(f"Select category for {merchant}:", 
+                                        ["Food", "Shopping", "Travel", "Utilities", "Entertainment", "Groceries", "Jewellery",
+                                         "Healthcare", "Fuel", "Electronics", "Banking", "Insurance", "Education", "Others"], 
+                                        key=merchant)
                 if category != "Others":
                     add_new_vendor(merchant, category)
                     all_data.loc[all_data["Merchant"] == merchant, "Category"] = category
                     st.success(f"✅ {merchant} categorized as {category}")
 
+        # Expense analysis
         st.subheader("📊 Expense Analysis")
         expenses = all_data[all_data["Amount"] > 0]
-        st.write("💰 **Total Spent:**", f"{expenses['Amount'].sum():,.2f}")
+        total_spent = expenses["Amount"].sum()
+        st.write("💰 **Total Spent:**", fmt_currency(total_spent))
         st.bar_chart(expenses.groupby("Category")["Amount"].sum())
         st.write("🏦 **Top 5 Merchants**")
-        st.dataframe(expenses.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head().apply(lambda x: f"{x:,.2f}"))
+        top_merchants = expenses.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head()
+        st.dataframe(top_merchants.apply(fmt_currency))
         st.write("🏦 **Expense by Account**")
         st.bar_chart(expenses.groupby("Account")["Amount"].sum())
 
-        st.subheader("📥 Download Results")
-        st.download_button("⬇️ Download as CSV", convert_df_to_csv(all_data), "expenses_all.csv", "text/csv")
-        st.download_button("⬇️ Download as Excel", convert_df_to_excel(all_data), "expenses_all.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Export
+        csv_data = convert_df_to_csv(all_data)
+        excel_data = convert_df_to_excel(all_data)
+        st.download_button("⬇️ Download as CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
+        st.download_button("⬇️ Download as Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
