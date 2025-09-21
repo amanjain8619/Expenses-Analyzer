@@ -181,12 +181,13 @@ def get_category(merchant):
 # ------------------------------
 def parse_date(date_str):
     """Handle dd/mm/yyyy, Month DD, DD Month formats."""
+    date_str = date_str.replace(",", "").strip()
     try:
         return datetime.strptime(date_str, "%d/%m/%Y").strftime("%d/%m/%Y")
     except:
-        for fmt in ["%b %d", "%B %d", "%d %b", "%d %B"]:
+        for fmt in ["%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"]:
             try:
-                return datetime.strptime(date_str + " 2025", f"{fmt} %Y").strftime("%d/%m/%Y")
+                return datetime.strptime(date_str, fmt).strftime("%d/%m/%Y")
             except:
                 pass
         return date_str
@@ -268,6 +269,19 @@ def extract_summary_from_pdf(pdf_file):
     summary = {}
     text_all = ""
     numeric_rows_collected = []  # list of (nums_list, page_idx, table_idx, row_idx, raw_row_text)
+
+    patterns = {
+        "Credit Limit": r"(?:Credit Limit|Sanctioned Credit Limit)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Available Credit Limit": r"Available Credit Limit\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Available Cash Limit": r"Available Cash Limit\s*(?:Rs)?\s*([\d,]+\.?\d*)",
+        "Total Due": r"(?:Total Dues|Total Due|Closing Balance Rs|Total Amount Due)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)(?:\s*DR)?",
+        "Minimum Due": r"(?:Minimum Amount Due|Minimum Due|Minimum Payment Rs|Minimum Payment)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Opening Balance": r"Opening Balance\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Previous Balance": r"Previous Balance\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Total Payments": r"(?:Total Payments|Payment/ Credits|New Credits Rs|Payment/Credits)\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Total Purchases": r"(?:Total Purchases|Purchase/ Debits|New Debits Rs|Purchase/Debits)\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Finance Charges": r"Finance Charges\s*[:\-]?\s*([\d,]+\.?\d*)",
+    }
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
@@ -357,16 +371,51 @@ def extract_summary_from_pdf(pdf_file):
                     if k not in summary:
                         summary[k] = v
 
+        # Additional regex parsing from text_all
+        for key, pat in patterns.items():
+            m = re.search(pat, text_all, re.IGNORECASE)
+            if m:
+                val_str = m.group(1).strip()
+                val = parse_number(val_str)
+                if val is not None:
+                    if key not in summary:
+                        summary[key] = fmt_num(val)
+
+        # Unify Opening/Previous Balance
+        if "Opening Balance" in summary and "Previous Balance" not in summary:
+            summary["Previous Balance"] = summary.pop("Opening Balance")
+        elif "Previous Balance" in summary and "Opening Balance" in summary:
+            # Prefer Previous if both
+            del summary["Opening Balance"]
+
         # Regex fallback for Statement Date if missing
         if "Statement Date" not in summary:
-            patterns = [
+            stmt_patterns = [
                 r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-                r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To"
+                r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To",
+                r"Date\s*(\d{2}/\d{2}/\d{4})",
+                r"At ([A-Za-z]+ \d{1,2}, \d{4})",
+                r"Statement Period\s*:\s*[\d A-Za-z,]+ To (\d{2} [A-Za-z]+, \d{4})"
             ]
-            for pattern in patterns:
+            for pattern in stmt_patterns:
                 m = re.search(pattern, text_all, re.IGNORECASE)
                 if m:
-                    summary["Statement Date"] = m.group(1).replace(",", "")
+                    date_str = m.group(1).replace(",", "")
+                    summary["Statement Date"] = parse_date(date_str)
+                    break
+
+        # Regex fallback for Payment Due Date if missing
+        if "Payment Due Date" not in summary:
+            due_patterns = [
+                r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+                r"Due by ([A-Za-z0-9 /,]+)",
+                r"Minimum Payment Due\s*([A-Za-z0-9 ,/]+)(?:\n|$)",
+            ]
+            for pattern in due_patterns:
+                m = re.search(pattern, text_all, re.IGNORECASE)
+                if m:
+                    date_str = m.group(1).replace(",", "")
+                    summary["Payment Due Date"] = parse_date(date_str)
                     break
 
     except Exception as e:
@@ -533,9 +582,9 @@ def convert_df_to_excel(df):
     processed_data = output.getvalue()
     return processed_data
 
-# ------------------------------
+# ==============================
 # Streamlit UI
-# ------------------------------
+# ==============================
 st.title("💳 Multi-Account Expense Analyzer")
 st.write("✅ App loaded successfully, waiting for uploads...")
 
