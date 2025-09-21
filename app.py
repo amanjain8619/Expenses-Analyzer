@@ -4,13 +4,15 @@ import pdfplumber
 import re
 from rapidfuzz import process
 from io import BytesIO
-from datetime import datetime
 import os
+import itertools
+from datetime import datetime
 
 # ==============================
 # Load vendor mapping
 # ==============================
 VENDOR_FILE = "vendors.csv"
+
 if os.path.exists(VENDOR_FILE):
     vendor_map = pd.read_csv(VENDOR_FILE)
 else:
@@ -18,15 +20,154 @@ else:
     vendor_map.to_csv(VENDOR_FILE, index=False)
 
 # ------------------------------
+# Helpers
+# ------------------------------
+def fmt_num(val):
+    try:
+        return f"{float(val):,.2f}"
+    except:
+        return val
+
+def parse_number(s):
+    try:
+        return float(str(s).replace(",", "").strip())
+    except:
+        return None
+
+# Scoring for candidate primary mapping (Credit Limit, Available Credit, Total Due, Minimum Due)
+def score_primary_candidate(mapping, nums):
+    # mapping: dict with keys 'Credit Limit','Available Credit','Total Due','Minimum Due' -> floats
+    # nums: original list of floats for this row
+    # Returns numeric score (higher is better)
+    cl = mapping.get("Credit Limit")
+    av = mapping.get("Available Credit")
+    td = mapping.get("Total Due")
+    md = mapping.get("Minimum Due")
+    if any(x is None for x in [cl, av, td, md]):
+        return -1e6
+    score = 0.0
+    # basic sanity
+    if cl < 0 or av < 0 or td < 0 or md < 0:
+        return -1e6
+    # credit >= available
+    if cl + 1e-6 >= av:
+        score += 3.0
+    else:
+        score -= 5.0
+    # minimum <= total
+    if md <= td + 1e-6:
+        score += 3.0
+    else:
+        score -= 5.0
+    # prefer cl being the maximum of row
+    if abs(cl - max(nums)) < 1e-6:
+        score += 1.5
+    # prefer available less than cl
+    if av <= cl:
+        score += 0.5
+    # prefer total_due positive
+    if td > 0:
+        score += 0.5
+    # prefer cl reasonably large ( > 1000 )
+    if cl >= 1000:
+        score += 0.5
+    # penalize wildly inconsistent totals (total >> cl * 3)
+    if cl > 0 and td > cl * 3:
+        score -= 2.0
+    return score
+
+# Scoring for secondary candidate mapping (Total Payments, Other Charges, Total Purchases, Previous Balance)
+def score_secondary_candidate(mapping):
+    tp = mapping.get("Total Payments")
+    oc = mapping.get("Other Charges")
+    purch = mapping.get("Total Purchases")
+    prev = mapping.get("Previous Balance")
+    if any(x is None for x in [tp, oc, purch, prev]):
+        return -1e6
+    # basic non-negative check
+    if any(x < -0.01 for x in [tp, oc, purch, prev]):
+        return -1e6
+    score = 0.0
+    # prefer purchases >= payments (often true)
+    if purch + 1e-6 >= tp:
+        score += 1.5
+    # prefer prev to be reasonably close to purchases (not always true, small weight)
+    if purch > 0 and abs(prev - purch) / (purch + 1e-6) < 0.4:
+        score += 0.8
+    # prefer non-zero purchases or payments
+    if purch > 0:
+        score += 0.5
+    if tp >= 0:
+        score += 0.2
+    return score
+
+# Try to find best primary mapping across numeric rows
+def choose_best_primary_mapping(numeric_rows):
+    """
+    numeric_rows: list of tuples (nums_list, page_idx, table_idx, row_idx, raw_row_text)
+    returns: (best_mapping_dict, primary_row_index_in_numeric_rows, used_perm)
+    """
+    fields_primary = ["Credit Limit", "Available Credit", "Total Due", "Minimum Due"]
+    best_score = -1e9
+    best_map = None
+    best_idx = None
+    best_perm = None
+
+    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
+        # perms of mapping numbers to fields
+        for perm in itertools.permutations(range(4)):
+            candidate = {fields_primary[i]: nums[perm[i]] for i in range(4)}
+            s = score_primary_candidate(candidate, nums)
+            if s > best_score:
+                best_score = s
+                best_map = candidate
+                best_idx = idx
+                best_perm = perm
+
+    if best_map is None:
+        return None, None, None
+
+    # format mapping
+    formatted = {k: fmt_num(v) for k, v in best_map.items()}
+    return formatted, best_idx, best_perm
+
+# Choose mappings for remaining numeric rows as secondary
+def map_secondary_rows(numeric_rows, exclude_index=None):
+    fields_secondary = ["Total Payments", "Other Charges", "Total Purchases", "Previous Balance"]
+    mapped = {}
+    for idx, (nums, pidx, tidx, ridx, raw) in enumerate(numeric_rows):
+        if idx == exclude_index:
+            continue
+        best_score = -1e9
+        best_map = None
+        best_perm = None
+        for perm in itertools.permutations(range(4)):
+            candidate = {fields_secondary[i]: nums[perm[i]] for i in range(4)}
+            s = score_secondary_candidate(candidate)
+            if s > best_score:
+                best_score = s
+                best_map = candidate
+                best_perm = perm
+        if best_map:
+            # add if keys not present
+            for k, v in best_map.items():
+                if k not in mapped:
+                    mapped[k] = fmt_num(v)
+    return mapped
+
+# ------------------------------
 # Fuzzy matching to find category
 # ------------------------------
 def get_category(merchant):
     m = str(merchant).lower()
-    matches = process.extractOne(
-        m,
-        vendor_map["merchant"].str.lower().tolist(),
-        score_cutoff=80
-    )
+    try:
+        matches = process.extractOne(
+            m,
+            vendor_map["merchant"].str.lower().tolist(),
+            score_cutoff=80
+        )
+    except Exception:
+        return "Others"
     if matches:
         matched_merchant = matches[0]
         category = vendor_map.loc[
@@ -51,118 +192,266 @@ def parse_date(date_str):
         return date_str
 
 # ------------------------------
-# Extract transactions from PDF (supports HDFC/ICICI/BoB + AMEX)
+# Extract transactions from PDF
 # ------------------------------
-def extract_transactions_from_pdf(pdf_file, account_name, debug=False):
+def extract_transactions_from_pdf(pdf_file, account_name):
     transactions = []
+    text_all = ""
+    is_amex = False
     with pdfplumber.open(pdf_file) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            tables = page.extract_tables()
-            extracted_from_table = False
-            if tables:
-                for table in tables:
-                    if len(table) < 2:
-                        continue
-                    header = [h.lower() if h else '' for h in table[0]]
-                    date_idx = next((i for i, h in enumerate(header) if 'date' in h or 'detail' in h), None)  # Flexible for 'Details'
-                    merch_idx = next((i for i, h in enumerate(header) if 'desc' in h or 'narr' in h or 'merchant' in h), None)
-                    amt_idx = next((i for i, h in enumerate(header) if 'amount' in h), None)
-                    type_idx = next((i for i, h in enumerate(header) if 'cr' in h or 'dr' in h or 'type' in h), None)
-                    
-                    if date_idx is None or merch_idx is None or amt_idx is None:
-                        continue  # Not a transaction table
-                    
-                    for row in table[1:]:  # Skip header
-                        if len(row) < max(date_idx, merch_idx, amt_idx) + 1:
-                            continue
-                        date = row[date_idx].strip() if row[date_idx] else ''
-                        merchant = row[merch_idx].strip() if row[merch_idx] else ''
-                        amount_str = row[amt_idx].strip().replace(',', '') if row[amt_idx] else ''
-                        drcr = row[type_idx].strip() if type_idx is not None and row[type_idx] else 'DR'
-                        
-                        if not date or not merchant or not amount_str:
-                            continue
-                        
+            text = page.extract_text()
+            if text:
+                text_all += text + "\n"
+                if "American Express" in text:
+                    is_amex = True
+
+            if not text:
+                continue
+
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+            if not is_amex:
+                # Non-AMEX parsing
+                for line in lines:
+                    match = re.match(
+                        r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?",
+                        line
+                    )
+                    if match:
+                        date, merchant, amount, drcr = match.groups()
                         try:
-                            amt_match = re.search(r'[\d.]+', amount_str)
-                            amt = float(amt_match.group())
+                            amt = round(float(amount.replace(",", "")), 2)
                         except:
                             continue
-                        
-                        # Detect credits more robustly
-                        if drcr.upper() == 'CR' or 'CR' in amount_str.upper() or 'CREDIT' in merchant.upper() or 'PAYMENT RECEIVED' in merchant.upper():
+                        if drcr and drcr.strip().lower().startswith("cr"):
                             amt = -amt
-                            drcr = 'CR'
-                        
-                        transactions.append([parse_date(date), merchant, round(amt, 2), drcr, account_name])
-                    extracted_from_table = True
-            
-            if not extracted_from_table:
-                # Fallback to text-based parsing
-                text = page.extract_text()
-                if debug and text:
-                    st.write(f"🔎 Debug Text Page {page_num}", text.split("\n")[:20])
-
-                if not text:
-                    continue
-
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-                if "American Express" in text:
-                    # Updated parsing for AMEX
-                    i = 0
-                    while i < len(lines):
-                        line = lines[i]
-                        m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+(?:([\d,]+\.\d{2})\s+)?([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
-                        if m:
-                            date_str, merchant, foreign, amount, cr_suffix = m.groups()
-                            if foreign:
-                                amt_str = amount
-                            else:
-                                amt_str = foreign if foreign else amount  # But since foreign None, use amount
+                            tr_type = "CR"
+                        else:
+                            tr_type = "DR"
+                        transactions.append([parse_date(date), merchant.strip(), amt, tr_type, account_name])
+            else:
+                # AMEX parsing per page
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+(?:([\d,]+\.\d{2})\s+)?([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
+                    if m:
+                        date_str, merchant, foreign, amount, cr_suffix = m.groups()
+                        amt_str = foreign if foreign else amount
+                        try:
                             amt = float(amt_str.replace(",", ""))
-                            drcr = "DR"
-                            if cr_suffix:
-                                amt = -amt
-                                drcr = "CR"
-                            else:
-                                # Special case for payment received
-                                if "PAYMENT RECEIVED" in merchant.upper():
-                                    if i + 1 < len(lines) and "CR" in lines[i + 1].upper():
-                                        amt = -amt
-                                        drcr = "CR"
-                                        i += 1  # Skip the Card Number line
-                            transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
-                        i += 1
-                else:
-                    # Single-line parsing for other banks
-                    for line in lines:
-                        m1 = re.match(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s?(CR|DR)?", line)
-                        if m1:
-                            date, merchant, amount, drcr = m1.groups()
-                            amt = float(amount.replace(",", ""))
-                            if drcr and drcr.upper() == "CR":
-                                amt = -amt
-                            transactions.append([parse_date(date), merchant.strip(), round(amt, 2), drcr if drcr else "DR", account_name])
+                        except:
+                            i += 1
                             continue
+                        drcr = "DR"
+                        if cr_suffix:
+                            amt = -amt
+                            drcr = "CR"
+                        else:
+                            if "PAYMENT RECEIVED" in merchant.upper():
+                                if i + 1 < len(lines) and "CR" in lines[i + 1].upper():
+                                    amt = -amt
+                                    drcr = "CR"
+                                    i += 1  # Skip the next line
+                        transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
+                    i += 1
 
-                        m2 = re.match(r"(\d{1,2}\s+[A-Za-z]{3,9})(?:\s+\d{1,2}\s+[A-Za-z]{3,9})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
-                        if m2:
-                            date_str, merchant, amount, cr_suffix = m2.groups()
-                            amt = float(amount.replace(",", ""))
-                            drcr = "DR"
-                            if cr_suffix or "CR" in line.upper() or "CREDIT" in line.upper() or "PAYMENT RECEIVED" in line.upper():
-                                amt = -amt
-                                drcr = "CR"
-                            transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
-                            continue
-
-            if debug:
-                st.write(f"🔎 Debug Tables Page {page_num}", tables[:2] if tables else "No tables detected")  # Print sample tables
-            
             st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
 
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
+
+# ------------------------------
+# Extract summary from PDF (robust HDFC + BoB mapping)
+# ------------------------------
+def extract_summary_from_pdf(pdf_file):
+    summary = {}
+    text_all = ""
+    numeric_rows_collected = []  # list of (nums_list, page_idx, table_idx, row_idx, raw_row_text)
+
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            for i in range(min(3, len(pdf.pages))):
+                page = pdf.pages[i]
+                page_text = page.extract_text()
+                if page_text:
+                    text_all += "\n" + page_text
+
+                tables = page.extract_tables() or []
+                for t_idx, table in enumerate(tables):
+                    if not table or len(table) == 0:
+                        continue
+
+                    # Normalize rows (strip)
+                    rows = [[(str(cell).strip() if cell is not None else "") for cell in r] for r in table]
+
+                    # 1) Header->value mapping only when the value row contains at least one numeric token
+                    header_keywords = ["due", "total", "payment", "credit limit", "available", "purchase", "opening", "minimum", "payments", "purchases"]
+                    for ridx in range(min(2, len(rows))):
+                        row_text = " ".join(rows[ridx]).lower()
+                        if any(k in row_text for k in header_keywords) and (ridx + 1) < len(rows):
+                            values_row = rows[ridx + 1]
+                            numbers_in_values = re.findall(r"[\d,]+\.\d{2}", " ".join(values_row))
+                            if not numbers_in_values:
+                                continue
+                            headers = rows[ridx]
+                            values = values_row
+                            for h, v in zip(headers, values):
+                                if not v:
+                                    continue
+                                v_nums = re.findall(r"[\d,]+\.\d{2}", v)
+                                v_clean = v.replace(",", "")
+                                h_low = h.lower()
+                                if v_nums:
+                                    if "payment due" in h_low or "due date" in h_low or "payment due date" in h_low:
+                                        summary["Payment Due Date"] = v_clean
+                                    elif "statement date" in h_low:
+                                        summary["Statement Date"] = v_clean
+                                    elif "total dues" in h_low or "total due" in h_low:
+                                        summary["Total Due"] = fmt_num(v_clean)
+                                    elif "minimum" in h_low:
+                                        summary["Minimum Due"] = fmt_num(v_clean)
+                                    elif "credit limit" in h_low and "available" not in h_low:
+                                        summary["Credit Limit"] = fmt_num(v_clean)
+                                    elif "available credit" in h_low or "available credit limit" in h_low:
+                                        summary["Available Credit"] = fmt_num(v_clean)
+                                    elif "available cash" in h_low:
+                                        summary["Available Cash"] = fmt_num(v_clean)
+                                    elif "opening balance" in h_low:
+                                        summary["Previous Balance"] = fmt_num(v_clean)
+                                    elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip():
+                                        summary["Total Payments"] = fmt_num(v_clean)
+                                    elif "purchase" in h_low or "debit" in h_low:
+                                        summary["Total Purchases"] = fmt_num(v_clean)
+                                    elif "finance" in h_low:
+                                        summary["Finance Charges"] = fmt_num(v_clean)
+                            continue
+
+                    # 2) Collect any rows with exactly 4 numeric values (BoB-like)
+                    for ridx, r in enumerate(rows):
+                        row_text = " ".join(r)
+                        numbers = re.findall(r"[\d,]+\.\d{2}", row_text)
+                        if len(numbers) == 4:
+                            nums_clean = [n.replace(",", "") for n in numbers]
+                            nums_float = []
+                            ok = True
+                            for n in nums_clean:
+                                try:
+                                    nums_float.append(float(n))
+                                except:
+                                    ok = False
+                                    break
+                            if ok:
+                                numeric_rows_collected.append((nums_float, i, t_idx, ridx, row_text))
+
+        # Choose best primary mapping among numeric rows using permutation scoring
+        if numeric_rows_collected:
+            primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
+            if primary_map:
+                for k, v in primary_map.items():
+                    if k not in summary:
+                        summary[k] = v
+                # map remaining rows as secondary
+                secondary_mapped = map_secondary_rows(numeric_rows_collected, exclude_index=primary_idx)
+                for k, v in secondary_mapped.items():
+                    if k not in summary:
+                        summary[k] = v
+
+        # Regex fallback for Statement Date if missing
+        if "Statement Date" not in summary:
+            patterns = [
+                r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+                r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To"
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, text_all, re.IGNORECASE)
+                if m:
+                    summary["Statement Date"] = m.group(1).replace(",", "")
+                    break
+
+    except Exception as e:
+        st.error(f"⚠️ Error while extracting summary: {e}")
+
+    if not summary:
+        summary = {"Info": "No summary details detected in PDF."}
+
+    # Final numeric normalization
+    for k in list(summary.keys()):
+        # if numeric-like string, format
+        if isinstance(summary[k], (int, float)):
+            summary[k] = fmt_num(summary[k])
+        else:
+            mnum = re.match(r"^\s*[\d,]+(?:\.\d+)?\s*$", str(summary[k]))
+            if mnum:
+                try:
+                    summary[k] = fmt_num(str(summary[k]).replace(",", ""))
+                except:
+                    pass
+
+    return summary
+
+# ------------------------------
+# Pretty Summary Cards (color-coded)
+# ------------------------------
+def display_summary(summary, account_name):
+    st.subheader(f"📋 Statement Summary for {account_name}")
+    st.json(summary)
+
+    def colored_card(label, value, color, icon=""):
+        return f"""
+        <div style="background:{color};padding:12px;border-radius:10px;margin:3px;text-align:center;color:white;font-weight:600;">
+            <div style="font-size:15px;">{icon} {label}</div>
+            <div style="font-size:18px;margin-top:6px;">{value}</div>
+        </div>
+        """
+
+    def try_float_str(s):
+        try:
+            return float(str(s).replace(",", ""))
+        except:
+            return 0.0
+
+    total_due_val = try_float_str(summary.get("Total Due", "0"))
+    min_due_val = try_float_str(summary.get("Minimum Due", "0"))
+    avail_credit_val = try_float_str(summary.get("Available Credit", "0"))
+
+    total_due_color = "#d9534f" if total_due_val > 0 else "#5cb85c"
+    min_due_color = "#f0ad4e" if min_due_val > 0 else "#5cb85c"
+    avail_credit_color = "#5bc0de" if avail_credit_val > 0 else "#d9534f"
+
+    col1, col2, col3 = st.columns(3)
+    col4, col5, col6 = st.columns(3)
+    col7, col8, col9 = st.columns(3)
+
+    with col1:
+        if summary.get("Statement Date"):
+            st.markdown(colored_card("📅 Statement Date", summary["Statement Date"], "#0275d8"), unsafe_allow_html=True)
+    with col2:
+        if summary.get("Payment Due Date"):
+            st.markdown(colored_card("⏰ Payment Due Date", summary["Payment Due Date"], "#5bc0de"), unsafe_allow_html=True)
+    with col3:
+        if summary.get("Previous Balance"):
+            st.markdown(colored_card("💳 Previous Balance", summary["Previous Balance"], "#6f42c1"), unsafe_allow_html=True)
+
+    with col4:
+        if summary.get("Total Due"):
+            st.markdown(colored_card("💰 Total Due", summary["Total Due"], total_due_color), unsafe_allow_html=True)
+    with col5:
+        if summary.get("Minimum Due"):
+            st.markdown(colored_card("⚠️ Minimum Due", summary["Minimum Due"], min_due_color), unsafe_allow_html=True)
+    with col6:
+        if summary.get("Credit Limit"):
+            st.markdown(colored_card("🏦 Credit Limit", summary["Credit Limit"], "#5cb85c"), unsafe_allow_html=True)
+
+    with col7:
+        if summary.get("Available Credit"):
+            st.markdown(colored_card("✅ Available Credit", summary["Available Credit"], avail_credit_color), unsafe_allow_html=True)
+    with col8:
+        if summary.get("Total Purchases"):
+            st.markdown(colored_card("🛒 Total Purchases", summary["Total Purchases"], "#0275d8"), unsafe_allow_html=True)
+    with col9:
+        if summary.get("Total Payments"):
+            st.markdown(colored_card("💵 Total Payments", summary["Total Payments"], "#20c997"), unsafe_allow_html=True)
 
 # ------------------------------
 # Extract transactions from CSV/XLSX
@@ -213,14 +502,14 @@ def normalize_dataframe(df, account_name):
     return df[["Date", "Merchant", "Amount", "Type", "Account"]]
 
 # ------------------------------
-# Categorize expenses
+# Categorize expenses (simple)
 # ------------------------------
 def categorize_expenses(df):
     df["Category"] = df["Merchant"].apply(get_category)
     return df
 
 # ------------------------------
-# Add new vendor if categorized by user
+# Add new vendor (persist)
 # ------------------------------
 def add_new_vendor(merchant, category):
     global vendor_map
@@ -228,20 +517,6 @@ def add_new_vendor(merchant, category):
     vendor_map = pd.concat([vendor_map, new_row], ignore_index=True)
     vendor_map.drop_duplicates(subset=["merchant"], keep="last", inplace=True)
     vendor_map.to_csv(VENDOR_FILE, index=False)
-
-# ------------------------------
-# Expense analysis
-# ------------------------------
-def analyze_expenses(df):
-    # Total spent should be sum of debits (positive amounts)
-    total_spent = df[df['Amount'] > 0]['Amount'].sum()
-    st.write("💰 **Total Spent:**", f"{total_spent:,.2f}")
-    st.write("📊 **Expense by Category**")
-    st.bar_chart(df[df['Amount'] > 0].groupby("Category")["Amount"].sum().round(2))
-    st.write("🏦 **Top 5 Merchants**")
-    st.dataframe(df[df['Amount'] > 0].groupby("Merchant")["Amount"].sum().round(2).sort_values(ascending=False).head())
-    st.write("🏦 **Expense by Account**")
-    st.bar_chart(df[df['Amount'] > 0].groupby("Account")["Amount"].sum().round(2))
 
 # ------------------------------
 # Export Helpers
@@ -255,45 +530,79 @@ def convert_df_to_excel(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Expenses", float_format="%.2f")
-    return output.getvalue()
+    processed_data = output.getvalue()
+    return processed_data
 
-# ==============================
+# ------------------------------
 # Streamlit UI
-# ==============================
+# ------------------------------
 st.title("💳 Multi-Account Expense Analyzer")
-st.write("Upload your bank/credit card statements (PDF, CSV, or Excel).")
+st.write("✅ App loaded successfully, waiting for uploads...")
 
-debug_mode = st.checkbox("Enable Debug Mode 🔎", value=False)
-
-uploaded_files = st.file_uploader("Upload Statements", type=["pdf", "csv", "xlsx"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload Statements",
+    type=["pdf", "csv", "xlsx"],
+    accept_multiple_files=True
+)
 
 if uploaded_files:
     all_data = pd.DataFrame(columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
     for uploaded_file in uploaded_files:
         account_name = st.text_input(f"Enter account name for {uploaded_file.name}", value=uploaded_file.name)
+
         if account_name:
             if uploaded_file.name.endswith(".pdf"):
-                df = extract_transactions_from_pdf(uploaded_file, account_name, debug=debug_mode)
+                df = extract_transactions_from_pdf(uploaded_file, account_name)
+                summary = extract_summary_from_pdf(uploaded_file)
+
+                # show summary and cards
+                display_summary(summary, account_name)
+
             elif uploaded_file.name.endswith(".csv"):
                 df = extract_transactions_from_csv(uploaded_file, account_name)
             elif uploaded_file.name.endswith(".xlsx"):
                 df = extract_transactions_from_excel(uploaded_file, account_name)
             else:
                 df = pd.DataFrame()
+
             all_data = pd.concat([all_data, df], ignore_index=True)
 
     if not all_data.empty:
         all_data = categorize_expenses(all_data)
         all_data["Amount"] = all_data["Amount"].round(2)
-
         st.subheader("📑 Extracted Transactions")
-        st.dataframe(all_data)
+        st.dataframe(all_data.style.format({"Amount": "{:,.2f}"}))
+
+        # Unknown merchant handling
+        others_df = all_data[all_data["Category"] == "Others"]
+        if not others_df.empty:
+            st.subheader("⚡ Assign Categories for Unknown Merchants")
+            for merchant in others_df["Merchant"].unique():
+                category = st.selectbox(
+                    f"Select category for {merchant}:",
+                    ["Food", "Shopping", "Travel", "Utilities", "Entertainment", "Groceries", "Jewellery", "Healthcare", "Fuel", "Electronics", "Banking", "Insurance", "Education", "Others"],
+                    key=merchant
+                )
+                if category != "Others":
+                    add_new_vendor(merchant, category)
+                    all_data.loc[all_data["Merchant"] == merchant, "Category"] = category
+                    st.success(f"✅ {merchant} categorized as {category}")
 
         st.subheader("📊 Expense Analysis")
-        analyze_expenses(all_data)
+        expenses = all_data[all_data["Amount"] > 0]
+        total_spent = expenses["Amount"].sum()
+        st.write("💰 **Total Spent:**", f"{total_spent:,.2f}")
+        st.bar_chart(expenses.groupby("Category")["Amount"].sum())
+        st.write("🏦 **Top 5 Merchants**")
+        top_merchants = expenses.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head()
+        st.dataframe(top_merchants.apply(lambda x: f"{x:,.2f}"))
+        st.write("🏦 **Expense by Account**")
+        st.bar_chart(expenses.groupby("Account")["Amount"].sum())
 
-        st.subheader("📥 Download Results")
-        st.download_button("⬇️ CSV", convert_df_to_csv(all_data), "expenses.csv", "text/csv")
-        st.download_button("⬇️ Excel", convert_df_to_excel(all_data),
-                           "expenses.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Export
+        csv_data = convert_df_to_csv(all_data)
+        excel_data = convert_df_to_excel(all_data)
+
+        st.download_button("⬇️ Download as CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
+        st.download_button("⬇️ Download as Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
