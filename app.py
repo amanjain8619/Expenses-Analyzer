@@ -8,9 +8,10 @@ import os
 from datetime import datetime
 
 # ==============================
-# Vendor mapping
+# Load vendor mapping
 # ==============================
 VENDOR_FILE = "vendors.csv"
+
 if os.path.exists(VENDOR_FILE):
     vendor_map = pd.read_csv(VENDOR_FILE)
 else:
@@ -28,13 +29,14 @@ def fmt_num(val):
 
 def parse_number(s):
     try:
-        return float(str(s).replace(",", "").strip())
+        return float(str(s).replace(",", "").replace("₹", "").strip())
     except:
         return None
 
 def parse_date(date_str):
+    """Handle dd/mm/yyyy, Month DD, DD Month formats."""
     date_str = date_str.replace(",", "").strip()
-    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"]:
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y", "%d %b, %Y", "%d %B, %Y"]:
         try:
             return datetime.strptime(date_str, fmt).strftime("%d/%m/%Y")
         except:
@@ -42,7 +44,7 @@ def parse_date(date_str):
     return date_str
 
 # ------------------------------
-# Vendor category matcher
+# Fuzzy matching to find category
 # ------------------------------
 def get_category(merchant):
     m = str(merchant).lower()
@@ -63,7 +65,64 @@ def get_category(merchant):
     return "Others"
 
 # ------------------------------
-# Extract summary from PDF
+# Extract transactions from PDF (generic + AMEX)
+# ------------------------------
+def extract_transactions_from_pdf(pdf_file, account_name):
+    transactions = []
+    text_all = ""
+    is_amex = False
+    with pdfplumber.open(pdf_file) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text()
+            if text:
+                text_all += text + "\n"
+                if "American Express" in text:
+                    is_amex = True
+            if not text:
+                continue
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+            if not is_amex:
+                # Non-AMEX parsing (HDFC, BOB, ICICI, etc.)
+                for line in lines:
+                    match = re.match(
+                        r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?",
+                        line
+                    )
+                    if match:
+                        date, merchant, amount, drcr = match.groups()
+                        try:
+                            amt = round(float(amount.replace(",", "")), 2)
+                        except:
+                            continue
+                        if drcr and drcr.strip().lower().startswith("cr"):
+                            amt = -amt
+                            tr_type = "CR"
+                        else:
+                            tr_type = "DR"
+                        transactions.append([parse_date(date), merchant.strip(), amt, tr_type, account_name])
+            else:
+                # AMEX parsing
+                for line in lines:
+                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})$", line)
+                    if m:
+                        date_str, merchant, amount = m.groups()
+                        try:
+                            amt = float(amount.replace(",", ""))
+                        except:
+                            continue
+                        tr_type = "DR"
+                        if "PAYMENT" in merchant.upper():
+                            amt = -amt
+                            tr_type = "CR"
+                        transactions.append([parse_date(date_str), merchant.strip(), amt, tr_type, account_name])
+
+            st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
+
+    return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
+
+# ------------------------------
+# Extract summary from PDF (supports HDFC, BoB, AMEX, ICICI, SBI)
 # ------------------------------
 def extract_summary_from_pdf(pdf_file):
     summary = {}
@@ -78,15 +137,38 @@ def extract_summary_from_pdf(pdf_file):
 
         text_all = re.sub(r"\s+", " ", text_all)
 
-        # ✅ Patterns for HDFC, BoB, ICICI, AMEX
-        patterns = {
-            "Credit Limit": r"(Credit Limit|Sanctioned Credit Limit)\s*Rs?\.?\s*([\d,]+\.?\d*)",
-            "Available Credit": r"(Available Credit Limit|Available Credit)\s*Rs?\.?\s*([\d,]+\.?\d*)",
-            "Total Due": r"(Total Dues|Total Due|Total Amount Due|Closing Balance)\s*Rs?\.?\s*([\d,]+\.?\d*)",
-            "Minimum Due": r"(Minimum Amount Due|Minimum Due|Minimum Payment Due)\s*Rs?\.?\s*([\d,]+\.?\d*)",
+        # --- Synonyms for each field ---
+        field_patterns = {
+            "Credit Limit": [
+                r"Credit Limit\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Sanctioned Credit Limit\s*Rs?\.?\s*([\d,]+\.\d{2})"
+            ],
+            "Available Credit": [
+                r"Available Credit Limit\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Available Credit\s*Rs?\.?\s*([\d,]+\.\d{2})"
+            ],
+            "Total Due": [
+                r"Total Dues\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Total Due\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Closing Balance\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Total Amount Due\s*Rs?\.?\s*([\d,]+\.\d{2})"
+            ],
+            "Minimum Due": [
+                r"Minimum Amount Due\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Minimum Payment Due\s*Rs?\.?\s*([\d,]+\.\d{2})",
+                r"Minimum Due\s*Rs?\.?\s*([\d,]+\.\d{2})"
+            ]
         }
 
-        # Regex for statement and due date
+        # --- Extract fields ---
+        for key, patterns in field_patterns.items():
+            for pat in patterns:
+                m = re.search(pat, text_all, re.IGNORECASE)
+                if m:
+                    summary[key] = fmt_num(m.group(1))
+                    break
+
+        # --- Dates ---
         stmt_patterns = [
             r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
             r"Statement Date\s*[:\-]?\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})",
@@ -97,34 +179,21 @@ def extract_summary_from_pdf(pdf_file):
             r"Payment Due Date\s*[:\-]?\s*([A-Za-z]{3,9}\s*\d{1,2},\s*\d{4})"
         ]
 
-        # ✅ Extract main fields
-        for key, pat in patterns.items():
-            m = re.search(pat, text_all, re.IGNORECASE)
-            if m:
-                val = m.group(2)
-                if val:
-                    summary[key] = fmt_num(val)
-
-        # ✅ Extract statement date
         for pat in stmt_patterns:
             m = re.search(pat, text_all, re.IGNORECASE)
             if m:
                 summary["Statement Date"] = parse_date(m.group(1))
                 break
 
-        # ✅ Extract due date
         for pat in due_patterns:
             m = re.search(pat, text_all, re.IGNORECASE)
             if m:
                 summary["Payment Due Date"] = parse_date(m.group(1))
                 break
 
-        # ✅ Normalize keys
+        # --- Normalize ---
         if "Total Due" in summary:
             summary["Used / Closing"] = summary["Total Due"]
-
-        if "Closing Balance" in summary and "Used / Closing" not in summary:
-            summary["Used / Closing"] = summary["Closing Balance"]
 
         return {
             "Statement date": summary.get("Statement Date", "N/A"),
@@ -140,74 +209,134 @@ def extract_summary_from_pdf(pdf_file):
         return {"Info": "No summary details detected in PDF."}
 
 # ------------------------------
-# Display summary cards
+# Display summary
 # ------------------------------
 def display_summary(summary, account_name):
     st.subheader(f"📋 Statement Summary — {account_name}")
-
-    def card(label, value, color):
-        return f"""
-        <div style="background:{color};padding:12px;border-radius:8px;margin:5px;text-align:center;color:white;">
-            <b>{label}</b><br><span style="font-size:16px;">{value}</span>
-        </div>
-        """
-
-    cols = st.columns(3)
-    with cols[0]:
-        st.markdown(card("📅 Statement date", summary["Statement date"], "#0275d8"), unsafe_allow_html=True)
-    with cols[1]:
-        st.markdown(card("⏰ Payment Due Date", summary["Payment Due Date"], "#f0ad4e"), unsafe_allow_html=True)
-    with cols[2]:
-        st.markdown(card("🏦 Total Limit", summary["Total Limit"], "#5bc0de"), unsafe_allow_html=True)
-
-    cols = st.columns(3)
-    with cols[0]:
-        st.markdown(card("💰 Used / Closing", summary["Used / Closing"], "#d9534f"), unsafe_allow_html=True)
-    with cols[1]:
-        st.markdown(card("✅ Available Credit", summary["Available Credit"], "#5cb85c"), unsafe_allow_html=True)
-    with cols[2]:
-        st.markdown(card("🛒 Min Due", summary["Min Due"], "#6f42c1"), unsafe_allow_html=True)
+    for k, v in summary.items():
+        st.write(f"**{k}**: {v}")
 
 # ------------------------------
-# PDF Transactions
+# CSV/XLSX Handling
 # ------------------------------
-def extract_transactions_from_pdf(pdf_file, account_name):
-    transactions = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if not text:
-                continue
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
+def extract_transactions_from_excel(file, account_name):
+    df = pd.read_excel(file)
+    return normalize_dataframe(df, account_name)
 
-            for line in lines:
-                match = re.match(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|DR)?", line)
-                if match:
-                    date, merchant, amount, drcr = match.groups()
-                    amt = float(amount.replace(",", ""))
-                    if drcr == "CR":
-                        amt = -amt
-                    transactions.append([parse_date(date), merchant, amt, drcr if drcr else "DR", account_name])
+def extract_transactions_from_csv(file, account_name):
+    df = pd.read_csv(file)
+    return normalize_dataframe(df, account_name)
 
-    return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
+def normalize_dataframe(df, account_name):
+    col_map = {
+        "date": "Date",
+        "transaction date": "Date",
+        "txn date": "Date",
+        "description": "Merchant",
+        "narration": "Merchant",
+        "merchant": "Merchant",
+        "amount": "Amount",
+        "debit": "Debit",
+        "credit": "Credit",
+        "type": "Type"
+    }
+    df_renamed = {}
+    for col in df.columns:
+        key = col.lower().strip()
+        if key in col_map:
+            df_renamed[col] = col_map[key]
+    df = df.rename(columns=df_renamed)
+
+    if "Debit" in df and "Credit" in df:
+        df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
+        df["Type"] = df.apply(lambda x: "DR" if x["Debit"] > 0 else "CR", axis=1)
+    elif "Amount" in df and "Type" in df:
+        df["Amount"] = df.apply(lambda x: -abs(x["Amount"]) if str(x["Type"]).upper().startswith("CR") else abs(x["Amount"]), axis=1)
+    elif "Amount" in df and "Type" not in df:
+        df["Type"] = "DR"
+
+    if "Date" not in df or "Merchant" not in df or "Amount" not in df:
+        st.error("❌ Could not detect required columns (Date, Merchant, Amount). Please check your file.")
+        return pd.DataFrame(columns=["Date", "Merchant", "Amount", "Type", "Account"])
+
+    df["Amount"] = df["Amount"].astype(float).round(2)
+    df["Account"] = account_name
+    return df[["Date", "Merchant", "Amount", "Type", "Account"]]
 
 # ------------------------------
-# App UI
+# Categorize expenses
 # ------------------------------
+def categorize_expenses(df):
+    df["Category"] = df["Merchant"].apply(get_category)
+    return df
+
+# ------------------------------
+# Add new vendor
+# ------------------------------
+def add_new_vendor(merchant, category):
+    global vendor_map
+    new_row = pd.DataFrame([[merchant.lower(), category]], columns=["merchant", "category"])
+    vendor_map = pd.concat([vendor_map, new_row], ignore_index=True)
+    vendor_map.drop_duplicates(subset=["merchant"], keep="last", inplace=True)
+    vendor_map.to_csv(VENDOR_FILE, index=False)
+
+# ------------------------------
+# Export Helpers
+# ------------------------------
+def convert_df_to_csv(df):
+    df["Amount"] = df["Amount"].round(2)
+    return df.to_csv(index=False).encode("utf-8")
+
+def convert_df_to_excel(df):
+    df["Amount"] = df["Amount"].round(2)
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Expenses", float_format="%.2f")
+    processed_data = output.getvalue()
+    return processed_data
+
+# ==============================
+# Streamlit UI
+# ==============================
 st.title("💳 Multi-Account Expense Analyzer")
-st.write("Upload your bank/credit card statements to extract transactions and summaries.")
+st.write("✅ App loaded successfully, waiting for uploads...")
 
-uploaded_files = st.file_uploader("Upload Statements", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload Statements",
+    type=["pdf", "csv", "xlsx"],
+    accept_multiple_files=True
+)
 
 if uploaded_files:
+    all_data = pd.DataFrame(columns=["Date", "Merchant", "Amount", "Type", "Account"])
+
     for uploaded_file in uploaded_files:
-        account_name = uploaded_file.name
+        account_name = st.text_input(f"Enter account name for {uploaded_file.name}", value=uploaded_file.name)
 
-        df = extract_transactions_from_pdf(uploaded_file, account_name)
-        summary = extract_summary_from_pdf(uploaded_file)
+        if account_name:
+            if uploaded_file.name.endswith(".pdf"):
+                df = extract_transactions_from_pdf(uploaded_file, account_name)
+                summary = extract_summary_from_pdf(uploaded_file)
+                display_summary(summary, account_name)
 
-        display_summary(summary, account_name)
+            elif uploaded_file.name.endswith(".csv"):
+                df = extract_transactions_from_csv(uploaded_file, account_name)
+            elif uploaded_file.name.endswith(".xlsx"):
+                df = extract_transactions_from_excel(uploaded_file, account_name)
+            else:
+                df = pd.DataFrame()
 
-        if not df.empty:
-            st.subheader(f"📑 Transactions — {account_name}")
-            st.dataframe(df)
+            all_data = pd.concat([all_data, df], ignore_index=True)
+
+    if not all_data.empty:
+        all_data = categorize_expenses(all_data)
+        all_data["Amount"] = all_data["Amount"].round(2)
+        st.subheader("📑 Extracted Transactions")
+        st.dataframe(all_data.style.format({"Amount": "{:,.2f}"}))
+
+        # Export
+        csv_data = convert_df_to_csv(all_data)
+        excel_data = convert_df_to_excel(all_data)
+
+        st.download_button("⬇️ Download as CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
+        st.download_button("⬇️ Download as Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
