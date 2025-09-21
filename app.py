@@ -121,7 +121,7 @@ def extract_transactions_from_pdf(pdf_file, account_name):
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
 # ------------------------------
-# Summary Extractor (robust)
+# Summary Extractor with bank-specific overrides
 # ------------------------------
 def extract_summary_from_pdf(pdf_file):
     summary = {}
@@ -137,6 +137,13 @@ def extract_summary_from_pdf(pdf_file):
 
         text_all = re.sub(r"\s+", " ", text_all)
 
+        # Bank detection
+        is_amex = "American Express" in text_all
+        is_hdfc = "HDFC Bank" in text_all
+        is_bob = "BOB" in text_all or "Bank of Baroda" in text_all
+        is_icici = "ICICI Bank" in text_all
+
+        # Default regex patterns
         patterns = {
             "Total Limit": r"(Credit Limit|Sanctioned Credit Limit)\s*[:\-]?\s*Rs?\.?\s*([\d,]+\.?\d*)",
             "Available Credit Limit": r"(Available Credit Limit)\s*[:\-]?\s*Rs?\.?\s*([\d,]+\.?\d*)",
@@ -145,6 +152,7 @@ def extract_summary_from_pdf(pdf_file):
             "Payment Due Date": r"(Payment Due Date|Due by)\s*[:\-]?\s*([0-9]{1,2}[ /-][A-Za-z0-9]+[ /-][0-9]{2,4})",
         }
 
+        # Apply regex
         for field, pat in patterns.items():
             m = re.search(pat, text_all, re.IGNORECASE)
             if m:
@@ -158,6 +166,7 @@ def extract_summary_from_pdf(pdf_file):
                         summary[field] = round(num_val, 2)
                 debug_matches.append(f"{field}: '{raw_line}' ➝ {summary.get(field)}")
 
+        # Expenses
         m = re.search(r"(Total Purchases|Purchases/ Debits|New Purchases)\s*[:\-]?\s*([\d,]+\.?\d*)", text_all, re.IGNORECASE)
         if m:
             num_val = parse_number(m.group(2))
@@ -165,14 +174,38 @@ def extract_summary_from_pdf(pdf_file):
                 summary["Expenses during the month"] = round(num_val, 2)
                 debug_matches.append(f"Expenses: '{m.group(0)}' ➝ {summary['Expenses during the month']}")
 
-        if not summary:
-            return {"Info": "No summary details detected in PDF."}
+        # ------------------------------
+        # Bank-specific overrides
+        # ------------------------------
+        if is_amex:
+            if "Credit Limit Rs" in text_all:
+                m = re.search(r"Credit Limit Rs\s*([\d,]+\.?\d*)", text_all)
+                if m: summary["Total Limit"] = round(parse_number(m.group(1)), 2)
+            if "Closing Balance Rs" in text_all:
+                m = re.search(r"Closing Balance Rs\s*([\d,]+\.?\d*)", text_all)
+                if m: summary["Used Limit"] = round(parse_number(m.group(1)), 2)
+            if "Available Credit Limit Rs" in text_all:
+                m = re.search(r"Available Credit Limit Rs\s*([\d,]+\.?\d*)", text_all)
+                if m: summary["Available Credit Limit"] = round(parse_number(m.group(1)), 2)
 
+        if is_hdfc:
+            m = re.search(r"Total Dues\s*([\d,]+\.?\d*)", text_all)
+            if m: summary["Used Limit"] = round(parse_number(m.group(1)), 2)
+
+        if is_bob:
+            m = re.search(r"Closing Balance\s*([\d,]+\.?\d*)", text_all)
+            if m: summary["Used Limit"] = round(parse_number(m.group(1)), 2)
+
+        if is_icici:
+            m = re.search(r"Total Amount Due\s*([\d,]+\.?\d*)", text_all)
+            if m: summary["Used Limit"] = round(parse_number(m.group(1)), 2)
+
+        # Debug output
         with st.expander("🔎 Debug Matches"):
             for line in debug_matches:
                 st.write(line)
 
-        return summary
+        return summary if summary else {"Info": "No summary details detected in PDF."}
 
     except Exception as e:
         return {"Error": str(e)}
