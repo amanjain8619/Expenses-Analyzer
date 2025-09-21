@@ -185,7 +185,7 @@ def parse_date(date_str):
     try:
         return datetime.strptime(date_str, "%d/%m/%Y").strftime("%d/%m/%Y")
     except:
-        for fmt in ["%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"]:
+        for fmt in ["%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y", "%B %d %Y"]:
             try:
                 return datetime.strptime(date_str, fmt).strftime("%d/%m/%Y")
             except:
@@ -271,17 +271,31 @@ def extract_summary_from_pdf(pdf_file):
     numeric_rows_collected = []  # list of (nums_list, page_idx, table_idx, row_idx, raw_row_text)
 
     patterns = {
-        "Credit Limit": r"(?:Credit Limit|Sanctioned Credit Limit)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Available Credit Limit": r"Available Credit Limit\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Available Cash Limit": r"Available Cash Limit\s*(?:Rs)?\s*([\d,]+\.?\d*)",
-        "Total Due": r"(?:Total Dues|Total Due|Closing Balance Rs|Total Amount Due)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)(?:\s*DR)?",
-        "Minimum Due": r"(?:Minimum Amount Due|Minimum Due|Minimum Payment Rs|Minimum Payment)\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Opening Balance": r"Opening Balance\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Previous Balance": r"Previous Balance\s*(?:Rs)?\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Total Payments": r"(?:Total Payments|Payment/ Credits|New Credits Rs|Payment/Credits)\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Total Purchases": r"(?:Total Purchases|Purchase/ Debits|New Debits Rs|Purchase/Debits)\s*[:\-]?\s*([\d,]+\.?\d*)",
-        "Finance Charges": r"Finance Charges\s*[:\-]?\s*([\d,]+\.?\d*)",
+        "Credit Limit": r"Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Sanctioned Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
+        "Available Credit": r"Available Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Available Credit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
+        "Available Cash Limit": r"Available Cash Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
+        "Total Due": r"Total Dues\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Total Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Closing Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Total Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)(?:\s*DR)?",
+        "Minimum Due": r"Minimum Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Payment\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
+        "Previous Balance": r"Previous Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Opening Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
+        "Total Payments": r"Total Payments\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Credits Rs - ([\d,]+\.?\d*) \+|Payment/ Credits\s*([\d,]+\.?\d*)|Payments/ Credits\s*([\d,]+\.?\d*)|Payment/Credits\s*([\d,]+\.?\d*)",
+        "Total Purchases": r"Total Purchases\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Debits Rs ([\d,]+\.?\d*)|Purchase/ Debits\s*([\d,]+\.?\d*)|Purchases/Debits\s*([\d,]+\.?\d*)",
+        "Finance Charges": r"Finance Charges\s*[:\- ]?\s*([\d,]+\.?\d*)",
     }
+
+    stmt_patterns = [
+        r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+        r"(\d{2}\s+[A-Za-z]{3}\s+\d{4})\s+To",
+        r"Statement Period\s*From\s*\w+\s*\d+\s*to\s*(\w+\s*\d+ \d{4})",
+        r"Statement Period\s*:\s*\d{2}\s+[A-Za-z]{3},\s*\d{4}\s*To\s*(\d{2}\s+[A-Za-z]{3},\s*\d{4})",
+        r"From\s*(\w+\s*\d+)\s*to\s*(\w+\s*\d+,\s*\d{4})"
+    ]
+
+    due_patterns = [
+        r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+        r"Due by\s*([A-Za-z]+\s*\d+,\s*\d{4})",
+        r"Minimum Payment Due\s*([A-Za-z]+\s*\d+,\s*\d{4})",
+        r"Payment Due Date\s*(\d{2}/\d{2}/\d{4})"
+    ]
 
     try:
         with pdfplumber.open(pdf_file) as pdf:
@@ -289,7 +303,7 @@ def extract_summary_from_pdf(pdf_file):
                 page = pdf.pages[i]
                 page_text = page.extract_text()
                 if page_text:
-                    text_all += "\n" + page_text
+                    text_all += page_text + "\n"
 
                 tables = page.extract_tables() or []
                 for t_idx, table in enumerate(tables):
@@ -358,6 +372,8 @@ def extract_summary_from_pdf(pdf_file):
                             if ok:
                                 numeric_rows_collected.append((nums_float, i, t_idx, ridx, row_text))
 
+        text_all = re.sub(r"\s+", " ", text_all).strip()
+
         # Choose best primary mapping among numeric rows using permutation scoring
         if numeric_rows_collected:
             primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
@@ -375,48 +391,32 @@ def extract_summary_from_pdf(pdf_file):
         for key, pat in patterns.items():
             m = re.search(pat, text_all, re.IGNORECASE)
             if m:
-                val_str = m.group(1).strip()
-                val = parse_number(val_str)
-                if val is not None:
-                    if key not in summary:
-                        summary[key] = fmt_num(val)
-
-        # Unify Opening/Previous Balance
-        if "Opening Balance" in summary and "Previous Balance" not in summary:
-            summary["Previous Balance"] = summary.pop("Opening Balance")
-        elif "Previous Balance" in summary and "Opening Balance" in summary:
-            # Prefer Previous if both
-            del summary["Opening Balance"]
+                val_str = next((g for g in m.groups() if g is not None), None)
+                if val_str:
+                    val = parse_number(val_str)
+                    if val is not None:
+                        if key not in summary:
+                            summary[key] = fmt_num(val)
 
         # Regex fallback for Statement Date if missing
-        if "Statement Date" not in summary:
-            stmt_patterns = [
-                r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-                r"(\d{2}\s+[A-Za-z]{3},\s*\d{4})\s+To",
-                r"Date\s*(\d{2}/\d{2}/\d{4})",
-                r"At ([A-Za-z]+ \d{1,2}, \d{4})",
-                r"Statement Period\s*:\s*[\d A-Za-z,]+ To (\d{2} [A-Za-z]+, \d{4})"
-            ]
-            for pattern in stmt_patterns:
-                m = re.search(pattern, text_all, re.IGNORECASE)
-                if m:
-                    date_str = m.group(1).replace(",", "")
-                    summary["Statement Date"] = parse_date(date_str)
-                    break
+        for pat in stmt_patterns:
+            m = re.search(pat, text_all, re.IGNORECASE)
+            if m:
+                if len(m.groups()) > 1 and m.group(2):
+                    summary["Statement Date"] = parse_date(m.group(2))
+                else:
+                    summary["Statement Date"] = parse_date(m.group(1))
+                break
 
         # Regex fallback for Payment Due Date if missing
-        if "Payment Due Date" not in summary:
-            due_patterns = [
-                r"Payment Due Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-                r"Due by ([A-Za-z0-9 /,]+)",
-                r"Minimum Payment Due\s*([A-Za-z0-9 ,/]+)(?:\n|$)",
-            ]
-            for pattern in due_patterns:
-                m = re.search(pattern, text_all, re.IGNORECASE)
-                if m:
-                    date_str = m.group(1).replace(",", "")
-                    summary["Payment Due Date"] = parse_date(date_str)
-                    break
+        for pat in due_patterns:
+            m = re.search(pat, text_all, re.IGNORECASE)
+            if m:
+                summary["Payment Due Date"] = parse_date(m.group(1))
+                break
+
+        if "Closing Balance" in summary and "Total Due" not in summary:
+            summary["Total Due"] = summary.pop("Closing Balance")
 
     except Exception as e:
         st.error(f"⚠️ Error while extracting summary: {e}")
