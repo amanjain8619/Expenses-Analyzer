@@ -77,14 +77,14 @@ def extract_transactions_from_pdf(pdf_file, account_name, debug=False):
                             continue
                         date = row[date_idx].strip() if row[date_idx] else ''
                         merchant = row[merch_idx].strip() if row[merch_idx] else ''
-                        amount_str = row[amt_idx].strip() if row[amt_idx] else ''
+                        amount_str = row[amt_idx].strip().replace(',', '') if row[amt_idx] else ''
                         drcr = row[type_idx].strip() if type_idx is not None and row[type_idx] else 'DR'
                         
                         if not date or not merchant or not amount_str:
                             continue
                         
                         try:
-                            amt_match = re.search(r'[\d.,]+', amount_str.replace(',', ''))
+                            amt_match = re.search(r'[\d.]+', amount_str)
                             amt = float(amt_match.group())
                         except:
                             continue
@@ -98,7 +98,7 @@ def extract_transactions_from_pdf(pdf_file, account_name, debug=False):
                     extracted_from_table = True
             
             if not extracted_from_table:
-                # Fallback to original text-based parsing if no tables found
+                # Fallback to text-based parsing
                 text = page.extract_text()
                 if debug and text:
                     st.write(f"🔎 Debug Text Page {page_num}", text.split("\n")[:20])
@@ -108,33 +108,59 @@ def extract_transactions_from_pdf(pdf_file, account_name, debug=False):
 
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-                for line in lines:
-                    # ----------------------------
-                    # 1️⃣ HDFC / ICICI / BoB style
-                    # ----------------------------
-                    m1 = re.match(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s?(CR|DR)?", line)
-                    if m1:
-                        date, merchant, amount, drcr = m1.groups()
-                        amt = float(amount.replace(",", ""))
-                        if drcr and drcr.upper() == "CR":
-                            amt = -amt
-                        transactions.append([parse_date(date), merchant.strip(), round(amt, 2), drcr if drcr else "DR", account_name])
-                        continue
+                if "American Express" in text:
+                    # Multi-line parsing for AMEX
+                    try:
+                        i = lines.index("Amount Rs") + 1
+                    except ValueError:
+                        i = 0
 
-                    # ----------------------------
-                    # 2️⃣ AMEX style (DD Month ... with optional posting date and CR suffix)
-                    # ----------------------------
-                    m2 = re.match(r"(\d{1,2}\s+[A-Za-z]{3,9})(?:\s+\d{1,2}\s+[A-Za-z]{3,9})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
-                    if m2:
-                        date_str, merchant, amount, cr_suffix = m2.groups()
-                        amt = float(amount.replace(",", ""))
-                        drcr = "DR"
-                        # Detect credits
-                        if cr_suffix or "CR" in line.upper() or "CREDIT" in line.upper() or "PAYMENT RECEIVED" in line.upper():
-                            amt = -amt
-                            drcr = "CR"
-                        transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
-                        continue
+                    while i < len(lines):
+                        if re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]):
+                            date_str = lines[i]
+                            i += 1
+                            merchant = ""
+                            while i < len(lines) and not re.match(r"^[\d,]+\.\d{2}$", lines[i]) and lines[i] != "CR" and not re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]):
+                                if "Card Number" not in lines[i]:
+                                    merchant += lines[i] + " "
+                                i += 1
+                            if i >= len(lines) or not re.match(r"^[\d,]+\.\d{2}$", lines[i]):
+                                continue
+                            amount_str = lines[i]
+                            amt = float(amount_str.replace(",", ""))
+                            drcr = "DR"
+                            i += 1
+                            while i < len(lines) and not re.match(r"^[A-Za-z]{3,9} \d{1,2}$", lines[i]) and not re.match(r"^[\d,]+\.\d{2}$", lines[i]):
+                                if lines[i] == "CR":
+                                    drcr = "CR"
+                                    amt = -amt
+                                # else skip
+                                i += 1
+                            transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
+                        else:
+                            i += 1
+                else:
+                    # Single-line parsing for other banks
+                    for line in lines:
+                        m1 = re.match(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s?(CR|DR)?", line)
+                        if m1:
+                            date, merchant, amount, drcr = m1.groups()
+                            amt = float(amount.replace(",", ""))
+                            if drcr and drcr.upper() == "CR":
+                                amt = -amt
+                            transactions.append([parse_date(date), merchant.strip(), round(amt, 2), drcr if drcr else "DR", account_name])
+                            continue
+
+                        m2 = re.match(r"(\d{1,2}\s+[A-Za-z]{3,9})(?:\s+\d{1,2}\s+[A-Za-z]{3,9})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Cr)?$", line)
+                        if m2:
+                            date_str, merchant, amount, cr_suffix = m2.groups()
+                            amt = float(amount.replace(",", ""))
+                            drcr = "DR"
+                            if cr_suffix or "CR" in line.upper() or "CREDIT" in line.upper() or "PAYMENT RECEIVED" in line.upper():
+                                amt = -amt
+                                drcr = "CR"
+                            transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
+                            continue
 
             if debug:
                 st.write(f"🔎 Debug Tables Page {page_num}", tables[:2] if tables else "No tables detected")  # Print sample tables
@@ -212,13 +238,15 @@ def add_new_vendor(merchant, category):
 # Expense analysis
 # ------------------------------
 def analyze_expenses(df):
-    st.write("💰 **Total Spent:**", f"{df['Amount'].sum():,.2f}")
+    # Total spent should be sum of debits (positive amounts)
+    total_spent = df[df['Amount'] > 0]['Amount'].sum()
+    st.write("💰 **Total Spent:**", f"{total_spent:,.2f}")
     st.write("📊 **Expense by Category**")
-    st.bar_chart(df.groupby("Category")["Amount"].sum().round(2))
+    st.bar_chart(df[df['Amount'] > 0].groupby("Category")["Amount"].sum().round(2))
     st.write("🏦 **Top 5 Merchants**")
-    st.dataframe(df.groupby("Merchant")["Amount"].sum().round(2).sort_values(ascending=False).head())
+    st.dataframe(df[df['Amount'] > 0].groupby("Merchant")["Amount"].sum().round(2).sort_values(ascending=False).head())
     st.write("🏦 **Expense by Account**")
-    st.bar_chart(df.groupby("Account")["Amount"].sum().round(2))
+    st.bar_chart(df[df['Amount'] > 0].groupby("Account")["Amount"].sum().round(2))
 
 # ------------------------------
 # Export Helpers
