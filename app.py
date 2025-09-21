@@ -7,6 +7,7 @@ from io import BytesIO
 import os
 import itertools
 from datetime import datetime
+import math
 
 # ==============================
 # Load vendor mapping
@@ -35,7 +36,7 @@ def parse_number(s):
         return None
 
 # Scoring for candidate primary mapping (Credit Limit, Available Credit, Total Due, Minimum Due)
-def score_primary_candidate(mapping, nums):
+def score_primary_candidate(mapping, nums, raw=''):
     # mapping: dict with keys 'Credit Limit','Available Credit','Total Due','Minimum Due' -> floats
     # nums: original list of floats for this row
     # Returns numeric score (higher is better)
@@ -74,9 +75,28 @@ def score_primary_candidate(mapping, nums):
     # penalize wildly inconsistent totals (total >> cl * 3)
     if cl > 0 and td > cl * 3:
         score -= 2.0
-    # penalize if md == av or td == av (likely cash limit)
-    if md == av or td == av or md == td:
+    # prefer td <= cl
+    if td <= cl + 1e-6:
+        score += 1.0
+    else:
+        score -= 2.0
+    # penalize if md == td
+    if abs(md - td) < 1e-6:
         score -= 3.0
+    # penalize if av == md or av == td
+    if abs(av - md) < 1e-6 or abs(av - td) < 1e-6:
+        score -= 3.0
+    # prefer md / td ~ 0.05
+    if td > 0 and md / td < 0.1:
+        score += 2.0
+    else:
+        score -= 2.0
+    # penalize if 'cash' in raw
+    if 'cash' in raw.lower():
+        score -= 5.0
+    # add log cl for larger cl
+    if cl > 0:
+        score += math.log(cl + 1) / 10
     return score
 
 # Scoring for secondary candidate mapping (Total Payments, Other Charges, Total Purchases, Previous Balance)
@@ -120,7 +140,7 @@ def choose_best_primary_mapping(numeric_rows):
         # perms of mapping numbers to fields
         for perm in itertools.permutations(range(4)):
             candidate = {fields_primary[i]: nums[perm[i]] for i in range(4)}
-            s = score_primary_candidate(candidate, nums)
+            s = score_primary_candidate(candidate, nums, raw)
             if s > best_score:
                 best_score = s
                 best_map = candidate
@@ -281,7 +301,7 @@ def extract_summary_from_pdf(pdf_file):
         "Minimum Due": r"Minimum Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Payment\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
         "Previous Balance": r"Previous Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Opening Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
         "Total Payments": r"Total Payments\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Credits Rs - ([\d,]+\.?\d*) \+|Payment/ Credits\s*([\d,]+\.?\d*)|Payments/ Credits\s*([\d,]+\.?\d*)|Payment/Credits\s*([\d,]+\.?\d*)",
-        "Total Purchases": r"Total Purchases\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Debits Rs ([\d,]+\.?\d*)|Purchase/ Debits\s*([\d,]+\.?\d*)|Purchases/Debits\s*([\d,]+\.?\d*)",
+        "Total Purchases": r"Total Purchases\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Debits Rs ([\d,]+\.?\d*)|Purchase/ Debits\s*([\d,]+\.?\d*)|Purchases/Debits\s*([\d,]+\.?\d*)|New Purchases/Debits\s*([\d,]+\.?\d*)",
         "Finance Charges": r"Finance Charges\s*[:\- ]?\s*([\d,]+\.?\d*)",
     }
 
@@ -355,7 +375,7 @@ def extract_summary_from_pdf(pdf_file):
                                         summary["Previous Balance"] = fmt_num(v_clean)
                                     elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip() or "payments/ credits" in h_low:
                                         summary["Total Payments"] = fmt_num(v_clean)
-                                    elif "purchase" in h_low or "debit" in h_low or "purchases/ debits" in h_low:
+                                    elif "purchase" in h_low or "debit" in h_low or "purchases/ debits" in h_low or "new purchases/debits" in h_low:
                                         summary["Total Purchases"] = fmt_num(v_clean)
                                     elif "finance" in h_low:
                                         summary["Finance Charges"] = fmt_num(v_clean)
@@ -379,18 +399,26 @@ def extract_summary_from_pdf(pdf_file):
 
         text_all = re.sub(r"\s+", " ", text_all).strip()
 
-        # Additional regex parsing from text_all
-        for key, pat in patterns.items():
-            m = re.search(pat, text_all, re.IGNORECASE)
-            if m:
-                val_str = next((g for g in m.groups() if g is not None), None)
-                if val_str:
-                    val = parse_number(val_str)
-                    if val is not None:
-                        if key not in summary:
-                            summary[key] = fmt_num(val)
+        # Specific row mapping for limit and summary rows
+        limit_row = None
+        summary_row = None
+        for tup in numeric_rows_collected[:]:  # Copy to modify
+            nums, pidx, tidx, ridx, raw = tup
+            raw_lower = raw.lower()
+            if 'cash limit' in raw_lower or 'available cash limit' in raw_lower:
+                limit_row = tup
+                summary['Credit Limit'] = fmt_num(nums[0])
+                summary['Available Credit'] = fmt_num(nums[1])
+                numeric_rows_collected.remove(tup)
+            if ('opening balance' in raw_lower or 'previous balance' in raw_lower) and 'payment' in raw_lower and ('purchase' in raw_lower or 'debit' in raw_lower) and ('closing' in raw_lower or 'total' in raw_lower):
+                summary_row = tup
+                summary['Previous Balance'] = fmt_num(nums[0])
+                summary['Total Payments'] = fmt_num(nums[1])
+                summary['Total Purchases'] = fmt_num(nums[2])
+                summary['Total Due'] = fmt_num(nums[3])
+                numeric_rows_collected.remove(tup)
 
-        # Choose best primary mapping among numeric rows using permutation scoring
+        # Choose best primary mapping among remaining numeric rows using permutation scoring
         if numeric_rows_collected:
             primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
             if primary_map:
@@ -402,6 +430,17 @@ def extract_summary_from_pdf(pdf_file):
                 for k, v in secondary_mapped.items():
                     if k not in summary:
                         summary[k] = v
+
+        # Additional regex parsing from text_all
+        for key, pat in patterns.items():
+            m = re.search(pat, text_all, re.IGNORECASE)
+            if m:
+                val_str = next((g for g in m.groups() if g is not None), None)
+                if val_str:
+                    val = parse_number(val_str)
+                    if val is not None:
+                        if key not in summary:
+                            summary[key] = fmt_num(val)
 
         # Regex fallback for Statement Date if missing
         for pat in stmt_patterns:
@@ -433,7 +472,10 @@ def extract_summary_from_pdf(pdf_file):
 
         cl = parse_number(derived_summary["Total Limit"])
         av = parse_number(summary.get("Available Credit", "N/A"))
-        if cl is not None and av is not None:
+        td = parse_number(summary.get("Total Due", "N/A"))
+        if td is not None:
+            derived_summary["Used Limit"] = fmt_num(td)
+        elif cl is not None and av is not None:
             derived_summary["Used Limit"] = fmt_num(cl - av)
         else:
             derived_summary["Used Limit"] = "N/A"
@@ -477,7 +519,7 @@ def display_summary(summary, account_name):
     avail_color = "#5cb85c" if avail_val > 0 else "#d9534f"
 
     col1, col2, col3 = st.columns(3)
-    col4, col5 = st.columns(2)
+    col4, col5, col6 = st.columns(3)
 
     with col1:
         st.markdown(colored_card("📅 Statement date", summary["Statement date"], "#0275d8"), unsafe_allow_html=True)
@@ -489,8 +531,8 @@ def display_summary(summary, account_name):
         st.markdown(colored_card("💰 Used Limit", summary["Used Limit"], used_color), unsafe_allow_html=True)
     with col5:
         st.markdown(colored_card("✅ Available Credit Limit", summary["Available Credit Limit"], avail_color), unsafe_allow_html=True)
-
-    st.markdown(colored_card("🛒 Expenses during the month", summary["Expenses during the month"], "#0275d8"), unsafe_allow_html=True)
+    with col6:
+        st.markdown(colored_card("🛒 Expenses during the month", summary["Expenses during the month"], "#0275d8"), unsafe_allow_html=True)
 
 # ------------------------------
 # Extract transactions from CSV/XLSX
