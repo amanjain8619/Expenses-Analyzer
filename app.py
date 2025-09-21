@@ -74,6 +74,9 @@ def score_primary_candidate(mapping, nums):
     # penalize wildly inconsistent totals (total >> cl * 3)
     if cl > 0 and td > cl * 3:
         score -= 2.0
+    # penalize if md == av or td == av (likely cash limit)
+    if md == av or td == av or md == td:
+        score -= 3.0
     return score
 
 # Scoring for secondary candidate mapping (Total Payments, Other Charges, Total Purchases, Previous Balance)
@@ -287,7 +290,8 @@ def extract_summary_from_pdf(pdf_file):
         r"(\d{2}\s+[A-Za-z]{3}\s+\d{4})\s+To",
         r"Statement Period\s*From\s*\w+\s*\d+\s*to\s*(\w+\s*\d+ \d{4})",
         r"Statement Period\s*:\s*\d{2}\s+[A-Za-z]{3},\s*\d{4}\s*To\s*(\d{2}\s+[A-Za-z]{3},\s*\d{4})",
-        r"From\s*(\w+\s*\d+)\s*to\s*(\w+\s*\d+,\s*\d{4})"
+        r"From\s*(\w+\s*\d+)\s*to\s*(\w+\s*\d+,\s*\d{4})",
+        r"Date\s*(\d{2}/\d{2}/\d{4})"
     ]
 
     due_patterns = [
@@ -315,9 +319,11 @@ def extract_summary_from_pdf(pdf_file):
 
                     # 1) Header->value mapping only when the value row contains at least one numeric token
                     header_keywords = ["due", "total", "payment", "credit limit", "available", "purchase", "opening", "minimum", "payments", "purchases"]
-                    for ridx in range(min(2, len(rows))):
+                    for ridx in range(len(rows)):
+                        if ridx + 1 >= len(rows):
+                            continue
                         row_text = " ".join(rows[ridx]).lower()
-                        if any(k in row_text for k in header_keywords) and (ridx + 1) < len(rows):
+                        if any(k in row_text for k in header_keywords):
                             values_row = rows[ridx + 1]
                             numbers_in_values = re.findall(r"[\d,]+\.\d{2}", " ".join(values_row))
                             if not numbers_in_values:
@@ -328,14 +334,14 @@ def extract_summary_from_pdf(pdf_file):
                                 if not v:
                                     continue
                                 v_nums = re.findall(r"[\d,]+\.\d{2}", v)
-                                v_clean = v.replace(",", "")
+                                v_clean = v.replace(",", "").replace(" DR", "")
                                 h_low = h.lower()
                                 if v_nums:
                                     if "payment due" in h_low or "due date" in h_low or "payment due date" in h_low:
                                         summary["Payment Due Date"] = v_clean
                                     elif "statement date" in h_low:
                                         summary["Statement Date"] = v_clean
-                                    elif "total dues" in h_low or "total due" in h_low:
+                                    elif "total dues" in h_low or "total due" in h_low or "closing balance" in h_low or "total amount due" in h_low:
                                         summary["Total Due"] = fmt_num(v_clean)
                                     elif "minimum" in h_low:
                                         summary["Minimum Due"] = fmt_num(v_clean)
@@ -345,15 +351,14 @@ def extract_summary_from_pdf(pdf_file):
                                         summary["Available Credit"] = fmt_num(v_clean)
                                     elif "available cash" in h_low:
                                         summary["Available Cash"] = fmt_num(v_clean)
-                                    elif "opening balance" in h_low:
+                                    elif "opening balance" in h_low or "previous balance" in h_low:
                                         summary["Previous Balance"] = fmt_num(v_clean)
-                                    elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip():
+                                    elif ("payment" in h_low and "credit" in h_low) or "payments" == h_low.strip() or "payments/ credits" in h_low:
                                         summary["Total Payments"] = fmt_num(v_clean)
-                                    elif "purchase" in h_low or "debit" in h_low:
+                                    elif "purchase" in h_low or "debit" in h_low or "purchases/ debits" in h_low:
                                         summary["Total Purchases"] = fmt_num(v_clean)
                                     elif "finance" in h_low:
                                         summary["Finance Charges"] = fmt_num(v_clean)
-                            continue
 
                     # 2) Collect any rows with exactly 4 numeric values (BoB-like)
                     for ridx, r in enumerate(rows):
@@ -374,6 +379,17 @@ def extract_summary_from_pdf(pdf_file):
 
         text_all = re.sub(r"\s+", " ", text_all).strip()
 
+        # Additional regex parsing from text_all
+        for key, pat in patterns.items():
+            m = re.search(pat, text_all, re.IGNORECASE)
+            if m:
+                val_str = next((g for g in m.groups() if g is not None), None)
+                if val_str:
+                    val = parse_number(val_str)
+                    if val is not None:
+                        if key not in summary:
+                            summary[key] = fmt_num(val)
+
         # Choose best primary mapping among numeric rows using permutation scoring
         if numeric_rows_collected:
             primary_map, primary_idx, perm = choose_best_primary_mapping(numeric_rows_collected)
@@ -386,17 +402,6 @@ def extract_summary_from_pdf(pdf_file):
                 for k, v in secondary_mapped.items():
                     if k not in summary:
                         summary[k] = v
-
-        # Additional regex parsing from text_all
-        for key, pat in patterns.items():
-            m = re.search(pat, text_all, re.IGNORECASE)
-            if m:
-                val_str = next((g for g in m.groups() if g is not None), None)
-                if val_str:
-                    val = parse_number(val_str)
-                    if val is not None:
-                        if key not in summary:
-                            summary[key] = fmt_num(val)
 
         # Regex fallback for Statement Date if missing
         for pat in stmt_patterns:
@@ -415,36 +420,41 @@ def extract_summary_from_pdf(pdf_file):
                 summary["Payment Due Date"] = parse_date(m.group(1))
                 break
 
-        if "Closing Balance" in summary and "Total Due" not in summary:
-            summary["Total Due"] = summary.pop("Closing Balance")
+        # Unify Opening/Previous Balance
+        if "Opening Balance" in summary and "Previous Balance" not in summary:
+            summary["Previous Balance"] = summary.pop("Opening Balance")
+        elif "Previous Balance" in summary and "Opening Balance" in summary:
+            # Prefer Previous if both
+            del summary["Opening Balance"]
+
+        # Derived fields for the desired summary
+        derived_summary = {}
+        derived_summary["Total Limit"] = summary.get("Credit Limit", "N/A")
+
+        cl = parse_number(derived_summary["Total Limit"])
+        av = parse_number(summary.get("Available Credit", "N/A"))
+        if cl is not None and av is not None:
+            derived_summary["Used Limit"] = fmt_num(cl - av)
+        else:
+            derived_summary["Used Limit"] = "N/A"
+
+        derived_summary["Statement date"] = summary.get("Statement Date", "N/A")
+        derived_summary["Expenses during the month"] = summary.get("Total Purchases", "N/A")
+        derived_summary["Available Credit Limit"] = summary.get("Available Credit", "N/A")
+        derived_summary["Payment Due Date"] = summary.get("Payment Due Date", "N/A")
+
+        return derived_summary
 
     except Exception as e:
         st.error(f"⚠️ Error while extracting summary: {e}")
 
-    if not summary:
-        summary = {"Info": "No summary details detected in PDF."}
-
-    # Final numeric normalization
-    for k in list(summary.keys()):
-        # if numeric-like string, format
-        if isinstance(summary[k], (int, float)):
-            summary[k] = fmt_num(summary[k])
-        else:
-            mnum = re.match(r"^\s*[\d,]+(?:\.\d+)?\s*$", str(summary[k]))
-            if mnum:
-                try:
-                    summary[k] = fmt_num(str(summary[k]).replace(",", ""))
-                except:
-                    pass
-
-    return summary
+    return {"Info": "No summary details detected in PDF."}
 
 # ------------------------------
 # Pretty Summary Cards (color-coded)
 # ------------------------------
 def display_summary(summary, account_name):
     st.subheader(f"📋 Statement Summary for {account_name}")
-    st.json(summary)
 
     def colored_card(label, value, color, icon=""):
         return f"""
@@ -460,47 +470,27 @@ def display_summary(summary, account_name):
         except:
             return 0.0
 
-    total_due_val = try_float_str(summary.get("Total Due", "0"))
-    min_due_val = try_float_str(summary.get("Minimum Due", "0"))
-    avail_credit_val = try_float_str(summary.get("Available Credit", "0"))
+    used_val = try_float_str(summary.get("Used Limit", "0"))
+    avail_val = try_float_str(summary.get("Available Credit Limit", "0"))
 
-    total_due_color = "#d9534f" if total_due_val > 0 else "#5cb85c"
-    min_due_color = "#f0ad4e" if min_due_val > 0 else "#5cb85c"
-    avail_credit_color = "#5bc0de" if avail_credit_val > 0 else "#d9534f"
+    used_color = "#d9534f" if used_val > 0 else "#5cb85c"
+    avail_color = "#5cb85c" if avail_val > 0 else "#d9534f"
 
     col1, col2, col3 = st.columns(3)
-    col4, col5, col6 = st.columns(3)
-    col7, col8, col9 = st.columns(3)
+    col4, col5 = st.columns(2)
 
     with col1:
-        if summary.get("Statement Date"):
-            st.markdown(colored_card("📅 Statement Date", summary["Statement Date"], "#0275d8"), unsafe_allow_html=True)
+        st.markdown(colored_card("📅 Statement date", summary["Statement date"], "#0275d8"), unsafe_allow_html=True)
     with col2:
-        if summary.get("Payment Due Date"):
-            st.markdown(colored_card("⏰ Payment Due Date", summary["Payment Due Date"], "#5bc0de"), unsafe_allow_html=True)
+        st.markdown(colored_card("⏰ Payment Due Date", summary["Payment Due Date"], "#f0ad4e"), unsafe_allow_html=True)
     with col3:
-        if summary.get("Previous Balance"):
-            st.markdown(colored_card("💳 Previous Balance", summary["Previous Balance"], "#6f42c1"), unsafe_allow_html=True)
-
+        st.markdown(colored_card("🏦 Total Limit", summary["Total Limit"], "#5bc0de"), unsafe_allow_html=True)
     with col4:
-        if summary.get("Total Due"):
-            st.markdown(colored_card("💰 Total Due", summary["Total Due"], total_due_color), unsafe_allow_html=True)
+        st.markdown(colored_card("💰 Used Limit", summary["Used Limit"], used_color), unsafe_allow_html=True)
     with col5:
-        if summary.get("Minimum Due"):
-            st.markdown(colored_card("⚠️ Minimum Due", summary["Minimum Due"], min_due_color), unsafe_allow_html=True)
-    with col6:
-        if summary.get("Credit Limit"):
-            st.markdown(colored_card("🏦 Credit Limit", summary["Credit Limit"], "#5cb85c"), unsafe_allow_html=True)
+        st.markdown(colored_card("✅ Available Credit Limit", summary["Available Credit Limit"], avail_color), unsafe_allow_html=True)
 
-    with col7:
-        if summary.get("Available Credit"):
-            st.markdown(colored_card("✅ Available Credit", summary["Available Credit"], avail_credit_color), unsafe_allow_html=True)
-    with col8:
-        if summary.get("Total Purchases"):
-            st.markdown(colored_card("🛒 Total Purchases", summary["Total Purchases"], "#0275d8"), unsafe_allow_html=True)
-    with col9:
-        if summary.get("Total Payments"):
-            st.markdown(colored_card("💵 Total Payments", summary["Total Payments"], "#20c997"), unsafe_allow_html=True)
+    st.markdown(colored_card("🛒 Expenses during the month", summary["Expenses during the month"], "#0275d8"), unsafe_allow_html=True)
 
 # ------------------------------
 # Extract transactions from CSV/XLSX
