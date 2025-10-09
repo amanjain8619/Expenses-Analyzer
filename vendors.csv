@@ -15,6 +15,7 @@ decathlon,Shopping
 shoppers stop,Shopping
 lifestyle,Shopping
 pantaloons,Shopping
+Nykaa,Shopping
 
 # ================= GROCERIES =================
 bigbasket,Groceries
@@ -246,5 +247,12 @@ acer,Electronics
 apple store,Electronics
 mi store,Electronics
 samsung store,Electronics
+
+# ================= Quick Commerce =================
+Blink,Quick Commerce
+Instamart,Quick Commerce
+Zepto,Quick Commerce
+Swiggy Instamart,Quick Commerce
+Blinkt,Quick Commerce
 
 Tele Transfer,Others
