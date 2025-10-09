@@ -468,7 +468,7 @@ def extract_summary_from_pdf(pdf_file):
         derived_summary = {}
         derived_summary["Statement date"] = summary.get("Statement Date", "N/A")
         derived_summary["Payment due date"] = summary.get("Payment Due Date", "N/A")
-        derived_summary["Available limit"] = summary.get("Available Credit", "N/A")
+        derived_summary["Total Dues"] = summary.get("Total Due", "N/A")
         derived_summary["Minimum payable"] = summary.get("Minimum Due", "N/A")
 
         return derived_summary
@@ -498,10 +498,10 @@ def display_summary(summary, account_name):
         except:
             return 0.0
 
-    avail_val = try_float_str(summary.get("Available limit", "0"))
+    total_due_val = try_float_str(summary.get("Total Dues", "0"))
     min_val = try_float_str(summary.get("Minimum payable", "0"))
 
-    avail_color = "#5cb85c" if avail_val > 0 else "#d9534f"
+    total_due_color = "#d9534f" if total_due_val > 0 else "#5cb85c"
     min_color = "#f0ad4e" if min_val > 0 else "#5cb85c"
 
     col1, col2 = st.columns(2)
@@ -512,7 +512,7 @@ def display_summary(summary, account_name):
     with col2:
         st.markdown(colored_card("⏰ Payment due date", summary["Payment due date"], "#f0ad4e"), unsafe_allow_html=True)
     with col3:
-        st.markdown(colored_card("✅ Available limit", summary["Available limit"], avail_color), unsafe_allow_html=True)
+        st.markdown(colored_card("💰 Total Dues", summary["Total Dues"], total_due_color), unsafe_allow_html=True)
     with col4:
         st.markdown(colored_card("⚠️ Minimum payable", summary["Minimum payable"], min_color), unsafe_allow_html=True)
 
