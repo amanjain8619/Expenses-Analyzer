@@ -16,6 +16,7 @@ shoppers stop,Shopping
 lifestyle,Shopping
 pantaloons,Shopping
 Nykaa ERetail,Shopping
+Westside,Shopping
 
 # ================= GROCERIES =================
 bigbasket,Groceries
@@ -88,6 +89,7 @@ booking.com,Travel
 airbnb,Travel
 blablacar,Travel
 ixigo,Travel
+Trident,Hotel
 
 # ================= WALLETS & PAYMENT APPS =================
 paytm,Wallet
