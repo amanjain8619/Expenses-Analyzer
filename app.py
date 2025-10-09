@@ -468,22 +468,10 @@ def extract_summary_from_pdf(pdf_file):
 
         # Derived fields for the desired summary
         derived_summary = {}
-        derived_summary["Total Limit"] = summary.get("Credit Limit", "N/A")
-
-        cl = parse_number(derived_summary["Total Limit"])
-        av = parse_number(summary.get("Available Credit", "N/A"))
-        td = parse_number(summary.get("Total Due", "N/A"))
-        if td is not None:
-            derived_summary["Used Limit"] = fmt_num(td)
-        elif cl is not None and av is not None:
-            derived_summary["Used Limit"] = fmt_num(cl - av)
-        else:
-            derived_summary["Used Limit"] = "N/A"
-
         derived_summary["Statement date"] = summary.get("Statement Date", "N/A")
-        derived_summary["Expenses during the month"] = summary.get("Total Purchases", "N/A")
-        derived_summary["Available Credit Limit"] = summary.get("Available Credit", "N/A")
-        derived_summary["Payment Due Date"] = summary.get("Payment Due Date", "N/A")
+        derived_summary["Payment due date"] = summary.get("Payment Due Date", "N/A")
+        derived_summary["Available limit"] = summary.get("Available Credit", "N/A")
+        derived_summary["Minimum payable"] = summary.get("Minimum Due", "N/A")
 
         return derived_summary
 
@@ -512,27 +500,23 @@ def display_summary(summary, account_name):
         except:
             return 0.0
 
-    used_val = try_float_str(summary.get("Used Limit", "0"))
-    avail_val = try_float_str(summary.get("Available Credit Limit", "0"))
+    avail_val = try_float_str(summary.get("Available limit", "0"))
+    min_val = try_float_str(summary.get("Minimum payable", "0"))
 
-    used_color = "#d9534f" if used_val > 0 else "#5cb85c"
     avail_color = "#5cb85c" if avail_val > 0 else "#d9534f"
+    min_color = "#f0ad4e" if min_val > 0 else "#5cb85c"
 
-    col1, col2, col3 = st.columns(3)
-    col4, col5, col6 = st.columns(3)
+    col1, col2 = st.columns(2)
+    col3, col4 = st.columns(2)
 
     with col1:
         st.markdown(colored_card("📅 Statement date", summary["Statement date"], "#0275d8"), unsafe_allow_html=True)
     with col2:
-        st.markdown(colored_card("⏰ Payment Due Date", summary["Payment Due Date"], "#f0ad4e"), unsafe_allow_html=True)
+        st.markdown(colored_card("⏰ Payment due date", summary["Payment due date"], "#f0ad4e"), unsafe_allow_html=True)
     with col3:
-        st.markdown(colored_card("🏦 Total Limit", summary["Total Limit"], "#5bc0de"), unsafe_allow_html=True)
+        st.markdown(colored_card("✅ Available limit", summary["Available limit"], avail_color), unsafe_allow_html=True)
     with col4:
-        st.markdown(colored_card("💰 Used Limit", summary["Used Limit"], used_color), unsafe_allow_html=True)
-    with col5:
-        st.markdown(colored_card("✅ Available Credit Limit", summary["Available Credit Limit"], avail_color), unsafe_allow_html=True)
-    with col6:
-        st.markdown(colored_card("🛒 Expenses during the month", summary["Expenses during the month"], "#0275d8"), unsafe_allow_html=True)
+        st.markdown(colored_card("⚠️ Minimum payable", summary["Minimum payable"], min_color), unsafe_allow_html=True)
 
 # ------------------------------
 # Extract transactions from CSV/XLSX
