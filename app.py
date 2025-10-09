@@ -281,8 +281,6 @@ def extract_transactions_from_pdf(pdf_file, account_name):
                         transactions.append([parse_date(date_str), merchant.strip(), round(amt, 2), drcr, account_name])
                     i += 1
 
-            st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
-
     return pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
 
 # ------------------------------
@@ -601,8 +599,8 @@ def convert_df_to_excel(df):
 # ==============================
 # Streamlit UI
 # ==============================
-st.title("💳 Multi-Account Expense Analyzer")
-st.write("✅ App loaded successfully, waiting for uploads...")
+st.title("💳 Credit card Expenses Analyzer")
+st.write("Upload your unlocked CC statement and get insights")
 
 uploaded_files = st.file_uploader(
     "Upload Statements",
