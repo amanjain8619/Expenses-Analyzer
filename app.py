@@ -8,7 +8,6 @@ import os
 import itertools
 from datetime import datetime
 import math
-import openai
 
 # ==============================
 # Load vendor mapping
