@@ -1,11 +1,10 @@
-# app.py
+# app_no_ai.py
 import streamlit as st
 import pandas as pd
 import io
 import os
-import json
+import re
 from datetime import datetime
-from openai import OpenAI
 
 # optional plotting
 try:
@@ -14,105 +13,137 @@ try:
 except Exception:
     MATPLOTLIB_AVAILABLE = False
 
-# -------------------------
-#  OpenAI client init
-# -------------------------
-api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-if not api_key:
-    st.error("OPENAI_API_KEY is not set. Set it in environment or Streamlit secrets.toml.")
-    st.stop()
+# optional OCR
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
 
-client = OpenAI(api_key=api_key)
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    OCR_AVAILABLE = False
+
+st.set_page_config(page_title="Expense Analyzer — Local (no OpenAI)", layout="wide")
+st.title("Expense Analyzer — Local (no OpenAI)")
+st.write("Parses CSV / XLSX / PDF bank statements locally using heuristics. OCR optional (pytesseract).")
 
 # -------------------------
-#  Utility functions
+# Utilities
 # -------------------------
-def safe_get_openai_text(resp):
-    """Support a couple of possible response shapes."""
+def safe_float(v):
     try:
-        return resp.choices[0].message.content
-    except Exception:
+        return float(v)
+    except:
         try:
-            return resp.choices[0].message["content"]
-        except Exception:
-            return str(resp)
+            s = str(v).replace(',','').replace('₹','').replace('INR','').strip()
+            if s == '':
+                return 0.0
+            return float(s)
+        except:
+            return 0.0
 
-def call_ai_extract_transactions(text_blob, model="gpt-4o-mini", max_tokens=1200, temperature=0.0):
-    """
-    Ask model to extract transactions from arbitrary table/text.
-    Returns a list of dicts: [{'date': 'YYYY-MM-DD', 'description':'', 'amount': 123.45, 'type':'debit'/'credit'}...]
-    """
-    system = "You are a precise financial data extractor. Output only valid JSON: a list of transactions."
-    user = (
-        "Extract transactions from the following input. Return strictly JSON array. "
-        "Each transaction must have: date (YYYY-MM-DD or ISO-like), description (string), amount (number), "
-        "type (either 'debit' or 'credit'). If sign is in amount, derive type accordingly. "
-        "If uncertain about date format, attempt ISO conversion. Now extract:\n\n"
-        f"INPUT:\n{text_blob}\n\nReturn ONLY JSON."
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        text = safe_get_openai_text(resp)
-        # sometimes the model includes explanation before JSON; find first '['
-        first_brace = text.find('[')
-        if first_brace != -1:
-            text = text[first_brace:]
-        data = json.loads(text)
-        # normalize
-        normalized = []
-        for t in data:
-            nt = {}
-            # date normalization
-            d = t.get("date") or t.get("txn_date") or t.get("transaction_date")
-            try:
-                nt['date'] = pd.to_datetime(d, dayfirst=False).strftime('%Y-%m-%d')
-            except Exception:
-                nt['date'] = str(d)
-            nt['description'] = t.get("description") or t.get("narration") or t.get("remark") or ""
-            amt = t.get("amount") or t.get("amt") or t.get("value") or 0
-            try:
-                amt_f = float(amt)
-            except Exception:
-                s = str(amt).replace(',','').replace('₹','').replace('INR','').strip()
+date_patterns = [
+    # dd-mm-yyyy or dd/mm/yyyy or d-m-yy
+    r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+    # yyyy-mm-dd
+    r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b',
+    # Monthname dd, yyyy  (e.g., Jun 5, 2025) or (June 5 2025)
+    r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)[\w\s\.,-]{0,20}\d{1,2}[,\s]*\d{4}\b',
+    # dd Monthname yyyy (e.g., 5 Jun 2025)
+    r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\s+\d{4}\b'
+]
+
+amount_pattern = r'(?:₹|\bINR\b)?\s*[-+]?\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?'
+
+def find_first_date(text):
+    for pat in date_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            s = m.group(0)
+            # try to parse
+            for fmt in ("%d-%m-%Y","%d/%m/%Y","%Y-%m-%d","%d-%m-%y","%d/%m/%y","%d %b %Y","%d %B %Y","%b %d, %Y","%B %d, %Y"):
                 try:
-                    amt_f = float(s)
-                except Exception:
-                    amt_f = 0.0
-            nt['amount'] = round(abs(amt_f), 2)
-            ttype = t.get("type") or t.get("dr_cr") or t.get("txn_type") or ""
-            ttype = str(ttype).lower()
-            if ttype in ['debit','dr','d','withdrawal','out']:
-                nt['type'] = 'debit'
-            elif ttype in ['credit','cr','c','deposit','in']:
-                nt['type'] = 'credit'
-            else:
-                # infer from sign
-                try:
-                    nt['type'] = 'debit' if float(amt_f) < 0 else 'credit'
+                    dt = datetime.strptime(s.replace(',', ''), fmt)
+                    return dt.strftime('%Y-%m-%d')
                 except:
-                    nt['type'] = 'debit'
-            normalized.append(nt)
-        return normalized
-    except Exception as e:
-        st.warning(f"AI extraction failed: {e}")
-        return []
+                    pass
+            # fallback to pandas
+            try:
+                dt = pd.to_datetime(s, dayfirst=True, errors='coerce')
+                if not pd.isna(dt):
+                    return dt.strftime('%Y-%m-%d')
+            except:
+                pass
+            return s
+    return None
+
+def find_amounts(line):
+    matches = re.findall(amount_pattern, line, flags=re.IGNORECASE)
+    cleaned = []
+    for m in matches:
+        s = re.sub(r'[^\d\.\-]','', m)
+        if s == '':
+            continue
+        try:
+            cleaned.append(float(s.replace(',','')))
+        except:
+            try:
+                cleaned.append(float(s))
+            except:
+                pass
+    return cleaned
+
+def infer_type_from_line(line, amount_value):
+    low = line.lower()
+    if any(k in low for k in ['cr', 'credit', 'deposit', 'credited']):
+        return 'credit'
+    if any(k in low for k in ['dr', 'debit', 'withdrawal', 'withdrawn', 'debited', 'payment', 'pmt']):
+        return 'debit'
+    # if amount had minus sign
+    if re.search(r'[-]\s*[0-9]', line):
+        return 'debit'
+    # fallback: positive = debit? For bank statements credit is often listed separately.
+    # We'll assume positive -> credit if word deposit/credited present else debit if words like paid/withdrawn present
+    return 'debit'
+
+def parse_text_transactions(text):
+    """
+    Parse text by scanning lines to find date + amount. Return list of txns.
+    """
+    txns = []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        date = find_first_date(ln)
+        amounts = find_amounts(ln)
+        if date and amounts:
+            # pick last amount as transaction amount
+            amt = amounts[-1]
+            ttype = infer_type_from_line(ln, amt)
+            # description: line without date and amount snippets
+            desc = re.sub('|'.join([re.escape(x) for x in re.findall(amount_pattern, ln, flags=re.IGNORECASE)]), '', ln)
+            # remove date substring
+            for pat in date_patterns:
+                desc = re.sub(pat, '', desc, flags=re.IGNORECASE)
+            desc = re.sub(r'\s{2,}', ' ', desc).strip(' -:,')
+            txns.append({'date': date, 'description': desc if desc else 'NA', 'amount': round(abs(float(amt)),2), 'type': ttype})
+    return txns
 
 def detect_bank_and_parse(df: pd.DataFrame):
     """
-    Heuristic detection for a few banks and mapping to a standardized transactions DataFrame.
-    Returns: transactions_df or None if unknown
-    Required columns in returned df: ['date','description','amount','type']
+    Heuristic detection for common csv/xlsx table formats.
     """
     cols = [c.lower() for c in df.columns]
-    # HDFC examples
-    if any('value date' in c for c in cols) and any('transaction description' in c or 'transaction details' in c or 'transaction' in c for c in cols):
-        date_col = next(c for c in df.columns if 'value date' in c.lower())
-        desc_col = next(c for c in df.columns if 'transaction' in c.lower())
+    # attempt HDFC-like
+    if any('value date' in c for c in cols) and any('transaction' in c for c in cols):
+        try:
+            date_col = next(c for c in df.columns if 'value date' in c.lower())
+            desc_col = next(c for c in df.columns if 'transaction' in c.lower())
+        except StopIteration:
+            return None
         debit_col = next((c for c in df.columns if 'debit' in c.lower()), None)
         credit_col = next((c for c in df.columns if 'credit' in c.lower()), None)
         txns = []
@@ -124,32 +155,22 @@ def detect_bank_and_parse(df: pd.DataFrame):
             desc = str(r[desc_col])
             amt = 0.0
             ttype = 'debit'
-            if debit_col and pd.notna(r[debit_col]) and str(r[debit_col]).strip() != '':
-                try:
-                    amt = float(str(r[debit_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'debit'
-            elif credit_col and pd.notna(r[credit_col]) and str(r[credit_col]).strip() != '':
-                try:
-                    amt = float(str(r[credit_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'credit'
+            if debit_col and pd.notna(r[debit_col]) and str(r[debit_col]).strip()!='':
+                amt = safe_float(r[debit_col])
+                ttype='debit'
+            elif credit_col and pd.notna(r[credit_col]) and str(r[credit_col]).strip()!='':
+                amt = safe_float(r[credit_col])
+                ttype='credit'
             else:
-                amt_col = next((c for c in df.columns if 'amount' in c.lower()), None)
-                if amt_col:
-                    val = r[amt_col]
-                    try:
-                        amt = float(str(val).replace(',','').replace('₹','')) if pd.notna(val) else 0.0
-                    except:
-                        amt = 0.0
-                    ttype = 'debit' if float(amt) < 0 else 'credit'
-            txns.append({'date':d,'description':desc,'amount':abs(amt),'type':ttype})
+                # fallback amount col
+                a = next((c for c in df.columns if 'amount' in c.lower()), None)
+                amt = safe_float(r[a]) if a else 0.0
+                ttype = 'debit' if amt < 0 else 'credit'
+            txns.append({'date':d,'description':desc,'amount':round(abs(amt),2),'type':ttype})
         return pd.DataFrame(txns)
 
-    # ICICI sample detection
-    if any('txn date' in c for c in cols) or (any('txn' in c for c in cols) and any('withdrawal' in c or 'deposit' in c for c in cols)):
+    # ICICI-like
+    if any('txn date' in c for c in cols) or any('narration' in c for c in cols):
         date_col = next((c for c in df.columns if 'txn date' in c.lower()), next((c for c in df.columns if 'date' in c.lower()), df.columns[0]))
         desc_col = next((c for c in df.columns if 'narration' in c.lower()), next((c for c in df.columns if 'description' in c.lower()), None))
         withdraw_col = next((c for c in df.columns if 'withdrawal' in c.lower()), None)
@@ -161,96 +182,58 @@ def detect_bank_and_parse(df: pd.DataFrame):
             except:
                 d = str(r[date_col])
             desc = str(r[desc_col]) if desc_col else ' '.join(str(x) for x in r.values[:3])
-            amt = 0.0
-            ttype = 'debit'
-            if withdraw_col and pd.notna(r[withdraw_col]) and str(r[withdraw_col]).strip() != '':
-                try:
-                    amt = float(str(r[withdraw_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'debit'
-            elif deposit_col and pd.notna(r[deposit_col]) and str(r[deposit_col]).strip() != '':
-                try:
-                    amt = float(str(r[deposit_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'credit'
+            amt = 0.0; ttype='debit'
+            if withdraw_col and pd.notna(r[withdraw_col]) and str(r[withdraw_col]).strip()!='':
+                amt = safe_float(r[withdraw_col]); ttype='debit'
+            elif deposit_col and pd.notna(r[deposit_col]) and str(r[deposit_col]).strip()!='':
+                amt = safe_float(r[deposit_col]); ttype='credit'
             else:
-                amt_col = next((c for c in df.columns if 'amount' in c.lower()), None)
-                if amt_col:
-                    val = r[amt_col]
-                    try:
-                        amt = float(str(val).replace(',','')) if pd.notna(val) else 0.0
-                    except:
-                        amt = 0.0
-                    ttype = 'debit' if float(amt) < 0 else 'credit'
-            txns.append({'date':d,'description':desc,'amount':abs(amt),'type':ttype})
+                a = next((c for c in df.columns if 'amount' in c.lower()), None)
+                amt = safe_float(r[a]) if a else 0.0
+                ttype = 'debit' if amt < 0 else 'credit'
+            txns.append({'date':d,'description':desc,'amount':round(abs(amt),2),'type':ttype})
         return pd.DataFrame(txns)
 
-    # Axis / generic narration-based formats
+    # generic narration-amount pattern
     if any('narration' in c for c in cols) or any('narr' in c for c in cols):
         date_col = next((c for c in df.columns if 'value date' in c.lower()), next((c for c in df.columns if 'date' in c.lower()), df.columns[0]))
         desc_col = next((c for c in df.columns if 'narration' in c.lower()), next((c for c in df.columns if 'description' in c.lower()), None))
         amt_col = next((c for c in df.columns if 'amount' in c.lower()), None)
         debit_col = next((c for c in df.columns if 'debit' in c.lower()), None)
         credit_col = next((c for c in df.columns if 'credit' in c.lower()), None)
-        txns = []
+        txns=[]
         for _, r in df.iterrows():
             try:
                 d = pd.to_datetime(r[date_col]).strftime('%Y-%m-%d')
             except:
                 d = str(r[date_col])
             desc = str(r[desc_col]) if desc_col else ' '.join(str(x) for x in r.values[:3])
-            amt = 0.0
-            ttype = 'debit'
-            if debit_col and pd.notna(r[debit_col]) and str(r[debit_col]).strip() != '':
-                try:
-                    amt = float(str(r[debit_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'debit'
-            elif credit_col and pd.notna(r[credit_col]) and str(r[credit_col]).strip() != '':
-                try:
-                    amt = float(str(r[credit_col]).replace(',',''))
-                except:
-                    amt = 0.0
-                ttype = 'credit'
+            amt=0.0; ttype='debit'
+            if debit_col and pd.notna(r[debit_col]) and str(r[debit_col]).strip()!='':
+                amt = safe_float(r[debit_col]); ttype='debit'
+            elif credit_col and pd.notna(r[credit_col]) and str(r[credit_col]).strip()!='':
+                amt = safe_float(r[credit_col]); ttype='credit'
             elif amt_col:
-                val = r[amt_col]
-                try:
-                    amt = float(str(val).replace(',','').replace('₹','')) if pd.notna(val) else 0.0
-                except:
-                    amt = 0.0
-                ttype = 'debit' if float(amt) < 0 else 'credit'
-            txns.append({'date':d,'description':desc,'amount':abs(amt),'type':ttype})
+                amt = safe_float(r[amt_col]); ttype='debit' if amt<0 else 'credit'
+            txns.append({'date':d,'description':desc,'amount':round(abs(amt),2),'type':ttype})
         return pd.DataFrame(txns)
 
-    # Unknown format
     return None
 
-def categorize_transactions(txn_df: pd.DataFrame, use_ai=False, model="gpt-4o-mini"):
-    """
-    Add a 'category' column to txn_df.
-    If use_ai is False, use rule-based keyword mapping.
-    If use_ai True, call OpenAI to categorize descriptions.
-    """
-    if 'category' not in txn_df.columns:
-        txn_df['category'] = ''
-
-    # simple rule-map
+# simple categorization
+def categorize_transactions(txn_df: pd.DataFrame):
     rule_map = {
-        'groceries': ['grocery','supermarket','big bazaar','dmart','reliance fresh','more','kirana'],
-        'fuel': ['petrol','diesel','fuel','indane','hpcl','bharat petroleum','bpcl'],
+        'groceries': ['grocery','supermarket','big bazaar','dmart','reliance fresh','kirana','grocery store'],
+        'fuel': ['petrol','diesel','fuel','hpcl','bharat petroleum','bpcl'],
         'rent': ['rent','landlord','house rent'],
         'salary': ['salary','payroll','salary credit'],
-        'utility': ['electricity','water bill','phone bill','internet','bill payment','broadband'],
+        'utility': ['electricity','water bill','phone bill','internet','broadband'],
         'entertainment': ['netflix','prime','spotify','movie','cinema','bookmyshow'],
-        'dining': ['restaurant','cafe','dominos','zomato','swiggy','food'],
+        'dining': ['restaurant','cafe','dominos','zomato','swiggy','food','dine','canteen'],
         'shopping': ['amazon','flipkart','myntra','ajio','shopping'],
         'emi': ['emi','equated','installment'],
-        'transfer': ['upi','neft','imps','transfer','rtgs']
+        'transfer': ['upi','neft','imps','transfer','rtgs','paytm']
     }
-
     def rule_cat(desc):
         d = desc.lower()
         for cat, kwlist in rule_map.items():
@@ -258,90 +241,36 @@ def categorize_transactions(txn_df: pd.DataFrame, use_ai=False, model="gpt-4o-mi
                 if kw in d:
                     return cat
         return 'other'
-
-    if not use_ai:
-        txn_df['category'] = txn_df['description'].apply(rule_cat)
-        return txn_df
-
-    # use AI to categorize each unique description to reduce calls
-    unique_desc = txn_df['description'].astype(str).unique().tolist()
-    desc_to_cat = {}
-    batch_prompt = (
-        "You are a helpful assistant that maps transaction descriptions to one of these categories: "
-        "groceries, fuel, rent, salary, utility, entertainment, dining, shopping, emi, transfer, other.\n\n"
-        "Input: A JSON list of descriptions. Output: JSON object mapping each description to exactly one category (from the list)."
-    )
-    try:
-        req_text = json.dumps(unique_desc, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":batch_prompt},{"role":"user","content":req_text}],
-            temperature=0.0,
-            max_tokens=800
-        )
-        text = safe_get_openai_text(resp)
-        first = text.find('{')
-        if first != -1:
-            text = text[first:]
-        mapping = json.loads(text)
-        desc_to_cat = mapping
-    except Exception as e:
-        st.warning(f"AI categorization failed, falling back to rule-based: {e}")
-        desc_to_cat = {}
-
-    def ai_or_rule(desc):
-        if desc in desc_to_cat:
-            return desc_to_cat[desc]
-        return rule_cat(desc)
-
-    txn_df['category'] = txn_df['description'].apply(lambda x: ai_or_rule(str(x)))
+    txn_df['category'] = txn_df['description'].apply(lambda x: rule_cat(str(x)))
     return txn_df
 
 def create_summary(txn_df: pd.DataFrame):
-    """
-    Returns a summary dict and aggregated DataFrame by category
-    """
     txn_df['amount_signed'] = txn_df.apply(lambda r: -r['amount'] if r['type']=='debit' else r['amount'], axis=1)
     total_spent = txn_df[txn_df['type']=='debit']['amount'].sum()
     total_received = txn_df[txn_df['type']=='credit']['amount'].sum()
     by_cat = txn_df.groupby('category')['amount'].sum().reset_index().sort_values(by='amount', ascending=False)
     recent = txn_df.sort_values(by='date', ascending=False).head(10)
-    return {
-        'total_spent': round(total_spent,2),
-        'total_received': round(total_received,2),
-        'by_category': by_cat,
-        'recent': recent
-    }
+    return {'total_spent':round(total_spent,2),'total_received':round(total_received,2),'by_category':by_cat,'recent':recent}
 
 def to_excel_bytes(dfs: dict):
-    """
-    dfs: dict of sheet_name -> dataframe
-    returns bytes buffer for xlsx
-    """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         for sheet_name, df in dfs.items():
             df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-        # writer.save()  # not needed inside context
     return output.getvalue()
 
 # -------------------------
-#  Streamlit UI
+# UI
 # -------------------------
-st.set_page_config(page_title="Expense Analyzer (Streamlit + OpenAI fallback)", layout="wide")
-st.title("Expense Analyzer — Streamlit + OpenAI fallback")
-st.markdown("Upload bank statements (PDF / CSV / XLSX). The app will try to parse automatically; for unknown formats it will call OpenAI to extract transactions.")
-
 with st.sidebar:
     st.header("Options")
-    ai_fallback = st.checkbox("Enable AI fallback for unknown formats", value=True)
-    ai_categorize = st.checkbox("Use AI for categorization (instead of rule-based)", value=False)
-    model_choice = st.selectbox("OpenAI model for extraction/categorization", options=["gpt-4o-mini","gpt-3.5-turbo"], index=0)
-    st.markdown("Make sure OPENAI_API_KEY is set in environment or secrets.")
+    do_ocr = st.checkbox("Attempt OCR on scanned PDFs (requires Tesseract & pytesseract)", value=False)
+    st.markdown("If OCR fails, ensure Tesseract is installed and in PATH.")
+    st.markdown("This app runs fully locally (no external AI).")
 
-uploaded_files = st.file_uploader("Upload Bank Statements (PDF / CSV / XLSX)", accept_multiple_files=True, type=['pdf','csv','xlsx','xls'])
+uploaded_files = st.file_uploader("Upload Bank Statements (PDF / CSV / XLSX) — multi-select", accept_multiple_files=True, type=['pdf','csv','xlsx','xls'])
 if not uploaded_files:
-    st.info("Upload at least one file to continue.")
+    st.info("Upload one or more files to start.")
     st.stop()
 
 all_txns = []
@@ -353,116 +282,154 @@ for uf in uploaded_files:
     try:
         if uf.name.lower().endswith(('.xls','.xlsx')):
             df = pd.read_excel(uf, engine='openpyxl')
+            st.info(f"Read spreadsheet `{uf.name}` with {len(df)} rows.")
         elif uf.name.lower().endswith('.csv'):
             df = pd.read_csv(uf)
+            st.info(f"Read CSV `{uf.name}` with {len(df)} rows.")
         elif uf.name.lower().endswith('.pdf'):
-            # lazy import of pdfplumber to avoid hard failure if not installed
-            try:
-                import pdfplumber
-            except Exception as e:
-                st.error("pdfplumber is required to read PDF files. Install with: pip install pdfplumber")
+            if pdfplumber is None:
+                st.error("pdfplumber is required to read PDFs. Install with: pip install pdfplumber")
                 st.stop()
             with pdfplumber.open(uf) as pdf:
                 pages = pdf.pages
-                all_text = []
+                texts = []
                 for page in pages:
                     txt = page.extract_text()
                     if txt:
-                        all_text.append(txt)
-                extracted_text = "\n\n".join(all_text)
-            st.info(f"Extracted text from PDF `{uf.name}` ({len(pages)} pages).")
+                        texts.append(txt)
+                extracted_text = "\n\n".join(texts)
+                st.info(f"Extracted text from PDF `{uf.name}` ({len(pages)} pages).")
+                # if no text and OCR requested, try OCR
+                if not extracted_text and do_ocr and OCR_AVAILABLE:
+                    st.info("No text found in PDF pages — attempting OCR (this may be slow)...")
+                    ocr_texts = []
+                    for page in pages:
+                        im = page.to_image(resolution=300).original
+                        try:
+                            txt = pytesseract.image_to_string(im)
+                            if txt:
+                                ocr_texts.append(txt)
+                        except Exception as e:
+                            st.warning(f"OCR failed on a page: {e}")
+                    extracted_text = "\n\n".join(ocr_texts)
+                    if extracted_text:
+                        st.success("OCR succeeded on PDF pages.")
         else:
             st.warning(f"Unsupported file type for `{uf.name}`. Skipping.")
             continue
     except Exception as e:
-        st.error(f"Failed to read file {uf.name}: {e}")
+        st.error(f"Failed to read file `{uf.name}`: {e}")
         continue
 
-    # If we have a DataFrame (CSV/XLSX), attempt heuristic parse first
     if df is not None:
         parsed = detect_bank_and_parse(df)
-        if parsed is not None:
+        if parsed is not None and len(parsed)>0:
             st.success(f"Parsed `{uf.name}` using heuristic parser.")
             parsed['source_file'] = uf.name
             all_txns.append(parsed)
             continue
         else:
-            st.warning(f"Could not detect bank format for `{uf.name}` (CSV/XLSX).")
-            # prepare preview for AI fallback if enabled
-            try:
-                preview = df.head(60).to_csv(index=False)
-            except Exception:
-                preview = str(df.head(60))
-            payload = f"Filename: {uf.name}\n\nColumns: {list(df.columns)}\n\nPreview:\n{preview}"
-    else:
-        # PDF path: use extracted text as payload
-        payload = f"Filename: {uf.name}\n\nExtracted Text:\n{extracted_text or ''}"
+            st.info(f"Could not auto-detect structured columns in `{uf.name}` — attempting to infer from table.")
+            # fallback: try to build txns by scanning rows for date+amount-like columns
+            # attempt to find date col and numeric col
+            date_cols = [c for c in df.columns if any(k in c.lower() for k in ['date','txn','value date','value_date'])]
+            amt_cols = [c for c in df.columns if any(k in c.lower() for k in ['amount','amt','debit','credit','withdrawal','deposit'])]
+            if not date_cols and len(df.columns)>0:
+                # try first column
+                date_cols = [df.columns[0]]
+            txns = []
+            for _, r in df.iterrows():
+                # try date from any of date_cols
+                dval = None
+                for dc in date_cols:
+                    try:
+                        dval = pd.to_datetime(r[dc], errors='coerce')
+                        if not pd.isna(dval):
+                            dval = dval.strftime('%Y-%m-%d')
+                            break
+                    except:
+                        pass
+                # find amount: prefer debit/credit columns
+                amt = None; ttype='debit'
+                # check explicit debit/credit
+                debit_col = next((c for c in df.columns if 'debit' in c.lower()), None)
+                credit_col = next((c for c in df.columns if 'credit' in c.lower()), None)
+                if debit_col and pd.notna(r[debit_col]) and str(r[debit_col]).strip()!='':
+                    amt = safe_float(r[debit_col]); ttype='debit'
+                elif credit_col and pd.notna(r[credit_col]) and str(r[credit_col]).strip()!='':
+                    amt = safe_float(r[credit_col]); ttype='credit'
+                else:
+                    # try any amt col
+                    for ac in amt_cols:
+                        v = r[ac]
+                        if pd.notna(v) and str(v).strip()!='':
+                            amt = safe_float(v)
+                            ttype = 'debit' if amt < 0 else 'credit'
+                            break
+                # description attempt
+                desc_col = next((c for c in df.columns if 'narration' in c.lower()), next((c for c in df.columns if 'description' in c.lower()), None))
+                desc = str(r[desc_col]) if desc_col else ' '.join(str(x) for x in r.values[:3])
+                if dval and amt is not None:
+                    txns.append({'date':dval,'description':desc,'amount':round(abs(float(amt)),2),'type':ttype})
+            if txns:
+                pdf_df = pd.DataFrame(txns)
+                pdf_df['source_file'] = uf.name
+                st.success(f"Inferred {len(pdf_df)} transactions from `{uf.name}`.")
+                all_txns.append(pdf_df)
+                continue
+            else:
+                st.warning(f"Could not infer transactions from table `{uf.name}`. Consider saving as CSV with clear headers.")
+                continue
 
-    # If we reach here, we need AI fallback to parse the payload
-    if ai_fallback:
-        with st.spinner(f"Calling OpenAI to extract transactions from {uf.name}..."):
-            extracted = call_ai_extract_transactions(payload, model=model_choice)
-        if extracted:
-            parsed_df = pd.DataFrame(extracted)
-            parsed_df['source_file'] = uf.name
-            st.success(f"AI extracted {len(parsed_df)} transactions from `{uf.name}`.")
-            all_txns.append(parsed_df)
+    # else: handle PDF text
+    if extracted_text:
+        parsed_txns = parse_text_transactions(extracted_text)
+        if parsed_txns:
+            dfp = pd.DataFrame(parsed_txns)
+            dfp['source_file'] = uf.name
+            st.success(f"Parsed {len(dfp)} transactions from PDF `{uf.name}` via text parsing.")
+            all_txns.append(dfp)
         else:
-            st.error(f"AI could not extract transactions from `{uf.name}`. Try improving PDF quality or saving as CSV/XLSX.")
+            st.warning(f"No transaction-like lines found in PDF text for `{uf.name}`. Try enabling OCR or convert to CSV/XLSX.")
     else:
-        st.info("AI fallback disabled — skipping file.")
+        st.warning(f"No usable content extracted from `{uf.name}`. Skipping.")
 
-# combine all transactions
+# combine results
 if len(all_txns) == 0:
-    st.error("No transactions parsed. Try enabling AI fallback or upload files in CSV/XLSX with clear columns.")
+    st.error("No transactions parsed from uploaded files. Try different files, enable OCR if needed, or save statements as CSV/XLSX with clear headers.")
     st.stop()
 
 txns_df = pd.concat(all_txns, ignore_index=True, sort=False)
-# ensure required columns exist
 for c in ['date','description','amount','type']:
     if c not in txns_df.columns:
         txns_df[c] = ''
 
-# basic cleaning
-txns_df['date'] = txns_df['date'].astype(str)
+# normalize
 try:
-    txns_df['date'] = pd.to_datetime(txns_df['date']).dt.strftime('%Y-%m-%d')
+    txns_df['date'] = pd.to_datetime(txns_df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
 except:
-    pass
+    txns_df['date'] = txns_df['date'].astype(str)
 txns_df['description'] = txns_df['description'].astype(str)
-# ensure amount numeric
-def safe_float(v):
-    try:
-        return float(v)
-    except:
-        try:
-            s = str(v).replace(',','').replace('₹','').replace('INR','').strip()
-            return float(s)
-        except:
-            return 0.0
 txns_df['amount'] = txns_df['amount'].apply(safe_float)
 txns_df['type'] = txns_df['type'].astype(str).apply(lambda x: x.lower() if x else 'debit')
 
-# Categorize
-with st.expander("Preview sample transactions (first 8 rows)"):
-    st.dataframe(txns_df.head(8))
+with st.expander("Preview sample transactions (first 10 rows)"):
+    st.dataframe(txns_df.head(10))
 
 if st.button("Categorize transactions now"):
-    with st.spinner("Categorizing..."):
-        txns_df = categorize_transactions(txns_df, use_ai=ai_categorize, model=model_choice)
+    with st.spinner("Categorizing locally..."):
+        txns_df = categorize_transactions(txns_df)
     st.success("Categorization complete.")
 
-# Show summary
 summary = create_summary(txns_df)
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Spent (debits)", f"₹ {summary['total_spent']}")
-col2.metric("Total Received (credits)", f"₹ {summary['total_received']}")
-col3.metric("Net (received - spent)", f"₹ {round(summary['total_received'] - summary['total_spent'],2)}")
+c1, c2, c3 = st.columns(3)
+c1.metric("Total Spent (debits)", f"₹ {summary['total_spent']}")
+c2.metric("Total Received (credits)", f"₹ {summary['total_received']}")
+c3.metric("Net (received - spent)", f"₹ {round(summary['total_received'] - summary['total_spent'],2)}")
 
 st.subheader("Spending by Category")
 st.dataframe(summary['by_category'].rename(columns={'amount':'total_amount'}).style.format({'total_amount':'{:.2f}'}))
 
-# plot: prefer matplotlib if available, otherwise use st.bar_chart
 if MATPLOTLIB_AVAILABLE:
     try:
         fig, ax = plt.subplots(figsize=(8,4))
@@ -480,15 +447,13 @@ else:
 st.subheader("Recent transactions")
 st.dataframe(summary['recent'])
 
-# export
-st.subheader("Export")
+# Export
 sheets = {
-    "transactions": txns_df.drop(columns=['amount_signed'], errors='ignore') if 'amount_signed' in txns_df.columns else txns_df,
+    "transactions": txns_df,
     "by_category": summary['by_category'],
     "recent": summary['recent']
 }
 xlsx_bytes = to_excel_bytes(sheets)
-st.download_button("Download full report (Excel)", data=xlsx_bytes, file_name="expense_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.download_button("Download full report (Excel)", data=xlsx_bytes, file_name="expense_report_local.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.markdown("---")
-st.caption("Notes: PDF extraction quality depends on the PDF. If the PDF is a scanned image, pdfplumber may not extract text — OCR would be needed. AI extraction may be imperfect; verify important rows and categories manually.")
+st.caption("Local parser uses heuristics. It works well for structured CSV/XLSX and readable PDFs. For scanned PDFs, enable OCR (requires Tesseract). If parsing fails, export the statement to CSV from your bank's website and upload CSV.")
