@@ -295,8 +295,8 @@ def extract_summary_from_pdf(pdf_file):
         "Credit Limit": r"Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Sanctioned Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
         "Available Credit": r"Available Credit Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Available Credit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
         "Available Cash Limit": r"Available Cash Limit\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
-        "Total Due": r"Total Dues\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Total Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Closing Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.\d*)|Total Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.\d*)(?:\s*DR)?|(\d{1,3}(?:,\d{3})*\.\d{2})\s*DR",
-        "Minimum Due": r"Minimum Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Payment\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|(\d{1,3}(?:,\d{3})*\.\d{2})\n\s*\d{1,3}(?:,\d{3})*\.\d{2} DR",
+        "Total Due": r"Total Dues\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Total Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Closing Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.\d*)|Total Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.\d*)(?:\s*DR)?|(\d{1,3}(?:,\d{3})*\.\d{2})\s*DR|Closing Balance Rs\s* =?\s*([\d,]+\.\d{2})|New Balance\s*\$?([\d,]+\.\d{2})",
+        "Minimum Due": r"Minimum Amount Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Due\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Minimum Payment\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|(\d{1,3}(?:,\d{3})*\.\d{2})\n\s*\d{1,3}(?:,\d{3})*\.\d{2} DR|Minimum Payment Rs\s*([\d,]+\.\d{2})|Minimum Payment Due\s*\$?([\d,]+\.\d{2})",
         "Previous Balance": r"Previous Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|Opening Balance\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)",
         "Total Payments": r"Total Payments\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Credits Rs - ([\d,]+\.?\d*) \+|Payment/ Credits\s*([\d,]+\.?\d*)|Payments/ Credits\s*([\d,]+\.?\d*)|Payment/Credits\s*([\d,]+\.?\d*)",
         "Total Purchases": r"Total Purchases\s*(?:Rs )?[:\- ]?\s*([\d,]+\.?\d*)|New Debits Rs ([\d,]+\.?\d*)|Purchase/ Debits\s*([\d,]+\.?\d*)|Purchases/Debits\s*([\d,]+\.?\d*)|New Purchases/Debits\s*([\d,]+\.?\d*)",
@@ -305,11 +305,12 @@ def extract_summary_from_pdf(pdf_file):
 
     stmt_patterns = [
         r"Statement Date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-        r"(\d{2}/\d{2}/\d{4})\n\s*\d{2} [A-Za-z]{3},\s*\d{4} To \d{2} [A-Za-z]{3},\s*\d{4}",
         r"(\d{2}\s+[A-Za-z]{3}\s+\d{4})\s+To",
         r"Statement Period\s*From\s*\w+\s*\d+\s*to\s*(\w+\s*\d+ \d{4})",
         r"Statement Period\s*:\s*\d{2}\s+[A-Za-z]{3},\s*\d{4}\s*To\s*(\d{2}\s+[A-Za-z]{3},\s*\d{4})",
         r"From\s*(\w+\s*\d+)\s*to\s*(\w+\s*\d+,\s*\d{4})",
+        r"Date\s*(\d{2}/\d{2}/\d{4})",
+        r"(\d{2}/\d{2}/\d{4})\s*\d{2} [A-Za-z]+, \d{4} To \d{2} [A-Za-z]+, \d{4}",
         r"Date\s*(\d{2}/\d{2}/\d{4})"
     ]
 
@@ -318,6 +319,7 @@ def extract_summary_from_pdf(pdf_file):
         r"Due by\s*([A-Za-z]+\s*\d+,\s*\d{4})",
         r"Minimum Payment Due\s*([A-Za-z]+\s*\d+,\s*\d{4})",
         r"Payment Due Date\s*(\d{2}/\d{2}/\d{4})",
+        r"received by [A-Za-z]+ \d{1,2}, \d{4}\s*([A-Za-z]+ \d{1,2}, \d{4})",
         r"(\d{2}/\d{2}/\d{4})\n\s*\d{1,3}(?:,\d{3})*\.\d{2}\n\s*\d{1,3}(?:,\d{3})*\.\d{2} DR"
     ]
 
