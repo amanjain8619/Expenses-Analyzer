@@ -8,10 +8,17 @@ import os
 import itertools
 from datetime import datetime
 import math
+import json
+import openai
+from typing import Dict, Any
 
 # ==============================
-# Config / Vendor map
+# CONFIG
 # ==============================
+st.set_page_config(layout="wide")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+USE_AI_FALLBACK_DEFAULT = True  # default toggle
+
 VENDOR_FILE = "vendors.csv"
 if os.path.exists(VENDOR_FILE):
     vendor_map = pd.read_csv(VENDOR_FILE)
@@ -19,55 +26,44 @@ else:
     vendor_map = pd.DataFrame(columns=["merchant", "category"])
     vendor_map.to_csv(VENDOR_FILE, index=False)
 
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
 # ==============================
 # Helpers
 # ==============================
-def fmt_num(val, add_rupee=True):
-    """Format numeric value to 2 decimals with commas. If non-numeric, return as-is."""
+def fmt_rupee(val):
     try:
         n = float(val)
-        s = f"{n:,.2f}"
-        return f"₹{s}" if add_rupee else s
-    except Exception:
+        return f"₹{n:,.2f}"
+    except:
         return val
 
 def parse_number(s):
-    """Parse a string number with commas to float, else None."""
     try:
         return float(str(s).replace(",", "").replace("₹", "").strip())
     except:
         return None
 
 def parse_date(date_str):
-    """Parse many date forms and return dd/mm/YYYY if possible, else return original trimmed string."""
     if not date_str:
         return "N/A"
     s = str(date_str).strip().replace(",", "")
-    # direct dd/mm/YYYY
+    # dd/mm/YYYY
     m = re.search(r"(\d{2}/\d{2}/\d{4})", s)
     if m:
         return m.group(1)
-    # try many textual formats
-    for fmt in ["%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y", "%d %m %Y", "%d %b, %Y", "%B %d,%Y", "%b %d,%Y"]:
+    # forms like "15 Aug 2025" or "Aug 15 2025"
+    for fmt in ("%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
         except:
             pass
-    # fallback: try to extract month-day-year like "August 5 2025"
-    m = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})\s+(\d{4})", s)
-    if m:
-        mon, day, yr = m.groups()
-        try:
-            return datetime.strptime(f"{mon} {day} {yr}", "%B %d %Y").strftime("%d/%m/%Y")
-        except:
-            try:
-                return datetime.strptime(f"{mon} {day} {yr}", "%b %d %Y").strftime("%d/%m/%Y")
-            except:
-                pass
-    return date_str
+    # fallback: return trimmed
+    return s
 
 # ------------------------------
-# Vendor category fuzzy match
+# vendor fuzzy match
 # ------------------------------
 def get_category(merchant):
     m = str(merchant).lower()
@@ -88,34 +84,18 @@ def get_category(merchant):
     return "Others"
 
 # ==============================
-# Transactions extraction (PDF)
-# Accepts pdf_bytes (bytes) or path-like; returns DataFrame
+# Transaction extraction
+# (unchanged logic but robust)
 # ==============================
-def extract_transactions_from_pdf(pdf_source, account_name):
-    """
-    pdf_source: bytes or file-like object or path
-    returns DataFrame with columns Date, Merchant, Amount, Type, Account
-    """
+def extract_transactions_from_pdf(pdf_bytes, account_name):
     transactions = []
-    # open pdf consistently from bytes
-    if isinstance(pdf_source, (bytes, bytearray)):
-        pdf_bytes = BytesIO(pdf_source)
-    else:
-        # streamlit UploadedFile behaves like a file-like; ensure we seek to start
-        try:
-            pdf_source.seek(0)
-        except Exception:
-            pass
-        pdf_bytes = pdf_source
-
-    with pdfplumber.open(pdf_bytes) as pdf:
-        # detect if american express style (helps parsing)
-        lower_text_sample = ""
+    pdf_file = BytesIO(pdf_bytes)
+    with pdfplumber.open(pdf_file) as pdf:
+        # detect AMEX
+        sample_text = ""
         for p in pdf.pages[:3]:
-            t = p.extract_text() or ""
-            lower_text_sample += t.lower() + "\n"
-
-        is_amex = "american express" in lower_text_sample or "americanexpress" in lower_text_sample
+            sample_text += (p.extract_text() or "") + "\n"
+        is_amex = "american express" in sample_text.lower() or "americanexpress" in sample_text.lower()
 
         for page_num, page in enumerate(pdf.pages, start=1):
             text = page.extract_text()
@@ -124,16 +104,14 @@ def extract_transactions_from_pdf(pdf_source, account_name):
             lines = [l.strip() for l in text.split("\n") if l.strip()]
 
             if is_amex:
-                # AMEX: lines often like "July 01 PAYMENT RECEIVED. THANK YOU 8,860.00 CR"
-                for i, line in enumerate(lines):
-                    # Many AMEX transaction lines begin with MonthName Day
-                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Cr|cr)?$", line)
+                # AMEX heuristics
+                for line in lines:
+                    m = re.match(r"([A-Za-z]{3,9}\s+\d{1,2})(?:\s+\d{4})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Cr|cr)?\s*$", line)
                     if m:
                         date_part, merchant, amount, cr = m.groups()
-                        date = parse_date(date_part + " 2025")  # year may not be present; keep as-is if wrong
-                        try:
-                            amt = float(amount.replace(",", ""))
-                        except:
+                        date = parse_date(date_part + " 2025")  # year guess if missing
+                        amt = parse_number(amount)
+                        if amt is None:
                             continue
                         if cr and cr.lower().startswith("cr"):
                             amt = -round(amt, 2)
@@ -142,32 +120,27 @@ def extract_transactions_from_pdf(pdf_source, account_name):
                             tr_type = "DR"
                         transactions.append([date, merchant.strip(), round(amt, 2), tr_type, account_name])
                     else:
-                        # fallback pattern: trailing CR/DR token
-                        m2 = re.match(r".+?([\d,]+\.\d{2})\s*(CR|Cr|cr|DR|Dr|dr)?$", line)
+                        # fallback: lines with INR/ Rs and amount
+                        m2 = re.search(r"(.+?)\s+(INR|Rs\.?|₹)\s*([\d,]+\.\d{2})\s*(CR|Cr|cr|DR|Dr|dr)?$", line)
                         if m2:
-                            amount = m2.group(1)
-                            cr = m2.group(2)
-                            try:
-                                amt = float(amount.replace(",", ""))
-                            except:
+                            merchant = m2.group(1)
+                            amount = m2.group(3)
+                            cr = m2.group(4)
+                            amt = parse_number(amount)
+                            if amt is None:
                                 continue
                             tr_type = "CR" if cr and cr.lower().startswith("cr") else "DR"
-                            # attempt to extract date from beginning of line
-                            date_search = re.match(r"([A-Za-z]{3,9}\s+\d{1,2}).+?", line)
-                            date = parse_date(date_search.group(1) + " 2025") if date_search else "N/A"
-                            # merchant = middle portion
-                            merchant = line
-                            transactions.append([date, merchant.strip(), round(-amt,2) if tr_type=="CR" else round(amt,2), tr_type, account_name])
+                            if tr_type == "CR":
+                                amt = -round(amt, 2)
+                            transactions.append(["N/A", merchant.strip(), round(amt, 2), tr_type, account_name])
             else:
-                # Generic: look for common date formats dd/mm/yyyy or dd-mm-yyyy at start
+                # generic parsing for dd/mm/yyyy lines
                 for line in lines:
-                    # pattern: 15/08/2025   AMAZON INDIA   1,234.56 DR
                     match = re.match(r"(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2}:\d{2})?\s+(.+?)\s+([\d,]+\.\d{2})\s*(CR|Dr|DR|Cr)?\s*$", line)
                     if match:
                         date, merchant, amount, drcr = match.groups()
-                        try:
-                            amt = float(amount.replace(",", ""))
-                        except:
+                        amt = parse_number(amount)
+                        if amt is None:
                             continue
                         if drcr and drcr.strip().lower().startswith("cr"):
                             amt = -round(amt, 2)
@@ -176,487 +149,276 @@ def extract_transactions_from_pdf(pdf_source, account_name):
                             tr_type = "DR"
                         transactions.append([parse_date(date), merchant.strip(), round(amt,2), tr_type, account_name])
                     else:
-                        # Try extraction from table cells
-                        # Look for lines with UPI / CODE and "INR" followed by amount and DR/CR
-                        m2 = re.search(r"(.+?)\s+(INR|Rs\.?|Rs)\s*([\d,]+\.\d{2})\s*(CR|Cr|cr|DR|Dr|dr)?$", line)
+                        m2 = re.search(r"(.+?)\s+(INR|Rs\.?|₹)\s*([\d,]+\.\d{2})\s*(CR|Cr|cr|DR|Dr|dr)?$", line)
                         if m2:
                             merchant = m2.group(1)
                             amount = m2.group(3)
-                            drcr = m2.group(4)
-                            try:
-                                amt = float(amount.replace(",", ""))
-                            except:
+                            cr = m2.group(4)
+                            amt = parse_number(amount)
+                            if amt is None:
                                 continue
-                            if drcr and drcr.lower().startswith("cr"):
-                                amt = -round(amt,2)
-                                tr_type = "CR"
-                            else:
-                                tr_type = "DR"
-                            # try to find a date in the same line or previous token
-                            date_search = re.search(r"(\d{2}/\d{2}/\d{4})", line)
-                            if date_search:
-                                date = parse_date(date_search.group(1))
-                            else:
-                                date = "N/A"
+                            tr_type = "CR" if cr and cr.lower().startswith("cr") else "DR"
+                            if tr_type == "CR":
+                                amt = -round(amt, 2)
+                            # try date in same line
+                            dmatch = re.search(r"(\d{2}/\d{2}/\d{4})", line)
+                            date = parse_date(dmatch.group(1)) if dmatch else "N/A"
                             transactions.append([date, merchant.strip(), round(amt,2), tr_type, account_name])
 
             st.info(f"📄 Page {page_num}: extracted {len(transactions)} rows so far")
 
     df = pd.DataFrame(transactions, columns=["Date", "Merchant", "Amount", "Type", "Account"])
-    # Normalize amounts: amounts where CR are negative already; ensure rounding
     if not df.empty:
         df["Amount"] = df["Amount"].astype(float).round(2)
     return df
 
 # ==============================
-# Summary extraction (robust for many card vendors)
-# Goal: return dict with keys: Statement date, Payment due date, Minimum payable, Total Dues
-# Accepts pdf_source bytes or file-like
+# RULE-BASED SUMMARY extraction
+# returns dict with 4 keys; if missing any, returns "N/A" for them
 # ==============================
-def extract_summary_from_pdf(pdf_source):
-    """
-    Robust heuristic-based extraction:
-    - Targeted parsing for American Express, HDFC, BOB (Bank of Baroda), ICICI (and generic).
-    - Returns dict:
-        {
-            "Statement date": "dd/mm/YYYY" or "N/A",
-            "Payment due date": "dd/mm/YYYY" or "N/A",
-            "Minimum payable": "₹x,xxx.xx" or "N/A",
-            "Total Dues": "₹x,xxx.xx" or "N/A"
-        }
-    """
-    # default
-    result = {
+def extract_summary_rules(pdf_bytes) -> Dict[str, Any]:
+    summary = {
         "Statement date": "N/A",
         "Payment due date": "N/A",
         "Minimum payable": "N/A",
         "Total Dues": "N/A"
     }
-
-    # prepare text_all
-    if isinstance(pdf_source, (bytes, bytearray)):
-        pdf_bytes = BytesIO(pdf_source)
-    else:
-        try:
-            pdf_source.seek(0)
-        except Exception:
-            pass
-        pdf_bytes = pdf_source
-
+    pdf_file = BytesIO(pdf_bytes)
     try:
-        with pdfplumber.open(pdf_bytes) as pdf:
-            pages_to_read = min(5, len(pdf.pages))
-            pages_text = []
-            lines = []
-            for i in range(pages_to_read):
-                txt = pdf.pages[i].extract_text() or ""
-                pages_text.append(txt)
-                lines.extend([l.strip() for l in txt.split("\n") if l.strip()])
+        with pdfplumber.open(pdf_file) as pdf:
+            first_pages_text = ""
+            for p in pdf.pages[:5]:
+                first_pages_text += (p.extract_text() or "") + "\n"
 
-            text_all = "\n".join(pages_text)
-            text_all_norm = re.sub(r"\s+", " ", text_all).strip()
-            low = text_all.lower()
-
-            # detect vendor hints
-            is_amex = "american express" in low or "americanexpress" in low
-            is_hdfc = "hdfc" in low
-            is_bob = "bobcard" in low or "bank of baroda" in low or "bob card" in low or "b o bcard" in low
-            is_icici = "icici" in low
-
-            # 1) Try easy label-based regex first (generic)
+            txt = first_pages_text
+            # Generic regex patterns
             # Statement date
-            m = re.search(r"statement date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", text_all, re.IGNORECASE)
+            m = re.search(r"statement date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", txt, re.IGNORECASE)
             if m:
-                result["Statement date"] = parse_date(m.group(1))
+                summary["Statement date"] = parse_date(m.group(1))
             else:
-                # other patterns: "Statement Period From June 19 to July 18, 2025" or "19 Jun - 18 Jul"
-                m2 = re.search(r"statement period\s*from\s*([A-Za-z0-9\s,]+?)\s*to\s*([A-Za-z0-9\s,]+?\d{4})", text_all, re.IGNORECASE)
+                # e.g. "14 Aug, 2025 To 13 Sep, 2025" -> take end
+                m2 = re.search(r"(\d{1,2}\s+[A-Za-z]{3,9}\,?\s*\d{4})\s*(to|-)\s*(\d{1,2}\s+[A-Za-z]{3,9}\,?\s*\d{4})", txt, re.IGNORECASE)
                 if m2:
-                    # take the end date (group 2)
-                    result["Statement date"] = parse_date(m2.group(2))
-                else:
-                    # dd Month, YYYY To dd Month, YYYY pattern at top
-                    m3 = re.search(r"(\d{1,2}\s+[A-Za-z]{3,9}\s*,?\s*\d{4})\s+to\s+(\d{1,2}\s+[A-Za-z]{3,9}\s*,?\s*\d{4})", text_all, re.IGNORECASE)
-                    if m3:
-                        # set statement date as end date
-                        result["Statement date"] = parse_date(m3.group(2))
+                    summary["Statement date"] = parse_date(m2.group(3))
 
-            # Payment due date generic
-            m = re.search(r"payment due date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", text_all, re.IGNORECASE)
+            # Payment due date
+            m = re.search(r"payment due date\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", txt, re.IGNORECASE)
             if m:
-                result["Payment due date"] = parse_date(m.group(1))
+                summary["Payment due date"] = parse_date(m.group(1))
             else:
-                # look for "Due by August 5 2025" / "Due by August 5, 2025"
-                m2 = re.search(r"due by\s*([A-Za-z]{3,9}\s+\d{1,2}\,?\s*\d{4})", text_all, re.IGNORECASE)
+                m2 = re.search(r"due by\s*([A-Za-z]{3,9}\s*\d{1,2}\,?\s*\d{4})", txt, re.IGNORECASE)
                 if m2:
-                    result["Payment due date"] = parse_date(m2.group(1))
+                    summary["Payment due date"] = parse_date(m2.group(1))
 
-            # Minimum payable generic
-            m = re.search(r"minimum (?:amount )?due\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
+            # Minimum payable
+            m = re.search(r"minimum (?:amount )?due\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", txt, re.IGNORECASE)
             if m:
-                result["Minimum payable"] = fmt_num(m.group(1))
+                summary["Minimum payable"] = fmt_rupee(m.group(1))
             else:
-                m2 = re.search(r"minimum payment\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                if m2:
-                    result["Minimum payable"] = fmt_num(m2.group(1))
-
-            # Total Dues generic
-            m = re.search(r"(?:total dues|total due|total amount due|closing balance)\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-            if m:
-                result["Total Dues"] = fmt_num(m.group(1))
-            else:
-                # sometimes "Closing Balance Rs = 34,899.91" or pattern with '='
-                m2 = re.search(r"\=\s*([\d,]+\.\d{2})\s*(?:[\s\D]{0,10})(?:minimum|min|due)?", text_all, re.IGNORECASE)
-                if m2:
-                    # choose as total dues if not set
-                    if result["Total Dues"] == "N/A":
-                        result["Total Dues"] = fmt_num(m2.group(1))
-
-            # 2) Bank-specific heuristics (when generic didn't pick correct values)
-            # AMEX: line with "Opening Balance Rs New Credits Rs New Debits Rs Closing Balance Rs Minimum Payment Rs"
-            if is_amex:
-                # try to find the arithmetic line containing '=' near "Opening Balance"
-                m = re.search(r"opening balance[^\n]*?([\d,]+\.\d{2})\s*[\-\+]\s*([\d,]+\.\d{2})\s*[\+\-]?\s*([\d,]+\.\d{2})\s*=\s*([\d,]+\.\d{2})\s*([\d,]+\.\d{2})?", text_all, re.IGNORECASE)
+                m = re.search(r"minimum payment\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", txt, re.IGNORECASE)
                 if m:
-                    # groups: opening, credit, debit, closing, minimum(optional)
-                    try:
-                        opening = parse_number(m.group(1))
-                        credit = parse_number(m.group(2))
-                        debit = parse_number(m.group(3))
-                        closing = parse_number(m.group(4))
-                        minimum = parse_number(m.group(5)) if m.group(5) else None
-                        if closing is not None:
-                            result["Total Dues"] = fmt_num(closing)
-                        if minimum is not None:
-                            result["Minimum payable"] = fmt_num(minimum)
-                    except Exception:
-                        pass
+                    summary["Minimum payable"] = fmt_rupee(m.group(1))
 
-                # fallback: explicit "Minimum Payment: Rs 1,745.00" and "Due by" near it
-                mmin = re.search(r"minimum payment\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                if mmin:
-                    result["Minimum payable"] = fmt_num(mmin.group(1))
-                mdue = re.search(r"due by\s*([A-Za-z]{3,9}\s+\d{1,2}\,?\s*\d{4})", text_all, re.IGNORECASE)
-                if mdue:
-                    result["Payment due date"] = parse_date(mdue.group(1))
+            # Total dues
+            m = re.search(r"(?:total dues|total due|total amount due|closing balance)\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", txt, re.IGNORECASE)
+            if m:
+                summary["Total Dues"] = fmt_rupee(m.group(1))
+            else:
+                # BOB style: date ... 1,409.42 28,188.33 DR => map smaller to min and larger to total
+                m2 = re.search(r"(\d{2}/\d{2}/\d{4}).{0,40}?([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(?:DR|Dr|dr)", txt)
+                if m2:
+                    d = parse_date(m2.group(1))
+                    v1 = parse_number(m2.group(2)); v2 = parse_number(m2.group(3))
+                    if v1 is not None and v2 is not None:
+                        # assign by magnitude
+                        mn = min(v1, v2); mx = max(v1, v2)
+                        summary["Payment due date"] = summary["Payment due date"] if summary["Payment due date"]!="N/A" else d
+                        summary["Minimum payable"] = fmt_rupee(mn)
+                        summary["Total Dues"] = fmt_rupee(mx)
 
-                # credit summary block: "Credit Limit Rs Available Credit Limit Rs At July 18, 2025 470,000.00 435,100.09"
-                mcred = re.search(r"at [A-Za-z0-9,\s]+?([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                if mcred and result["Total Dues"] == "N/A":
-                    # sometimes AMEX shows closing or available; keep only if applicable (no strong mapping)
-                    pass
-
-            # HDFC specific
-            if is_hdfc:
-                # often HDFC has the header and then a row: "Payment Due Date Total Dues Minimum Amount Due" followed by a row with date and 2 numbers
-                for idx, ln in enumerate(lines):
-                    lowln = ln.lower()
-                    if "payment due date" in lowln and ("total dues" in lowln or "total due" in lowln or "minimum amount" in lowln):
-                        # check next 1-2 lines for numbers
-                        for j in range(idx, min(idx+3, len(lines))):
-                            nums = re.findall(r"(\d{2}/\d{2}/\d{4})|([\d,]+\.\d{2})", lines[j])
-                            # flatten
-                            flat = [t[0] or t[1] for t in nums]
-                            if len(flat) >= 3:
-                                # first is date, then total dues and minimum (or date + total + min)
-                                # Heuristic: if first token is date
-                                if re.match(r"\d{2}/\d{2}/\d{4}", flat[0]):
-                                    # Example order: date total min OR date min total -> we will choose based on magnitude (min should be <= total)
-                                    cand = flat[1:3]
-                                    vals = [parse_number(x) for x in cand]
-                                    if vals[0] is not None and vals[1] is not None:
-                                        # decide mapping: if second >= first then second is total, else first is total
-                                        if vals[1] >= vals[0]:
-                                            # first likely min, second likely total
-                                            result["Payment due date"] = parse_date(flat[0])
-                                            result["Minimum payable"] = fmt_num(vals[0])
-                                            result["Total Dues"] = fmt_num(vals[1])
-                                        else:
-                                            result["Payment due date"] = parse_date(flat[0])
-                                            result["Total Dues"] = fmt_num(vals[0])
-                                            result["Minimum payable"] = fmt_num(vals[1])
-                                        break
+            # HDFC table row heuristics: find line with "Payment Due Date" header and subsequent numbers
+            # We'll scan first 20 lines looking for a header line containing both 'Payment' and 'Total' or 'Minimum'
+            lines = [l.strip() for l in txt.split("\n") if l.strip()]
+            for idx, ln in enumerate(lines[:20]):
+                low = ln.lower()
+                if "payment due date" in low and ("total" in low or "minimum" in low):
+                    # next 1-2 lines often contain the values
+                    for j in range(idx+1, min(idx+4, len(lines))):
+                        row = lines[j]
+                        # extract date + two numbers
+                        m3 = re.search(r"(\d{2}/\d{2}/\d{4})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", row)
+                        if m3:
+                            d = parse_date(m3.group(1))
+                            n1 = parse_number(m3.group(2)); n2 = parse_number(m3.group(3))
+                            # decide mapping by magnitude
+                            if n1 is not None and n2 is not None:
+                                if n1 <= n2:
+                                    summary["Payment due date"] = d
+                                    summary["Minimum payable"] = fmt_rupee(n1)
+                                    summary["Total Dues"] = fmt_rupee(n2)
                                 else:
-                                    # if date not found in same line, maybe in previous line
-                                    prev_date = None
-                                    if idx > 0:
-                                        dmatch = re.search(r"(\d{2}/\d{2}/\d{4})", lines[idx-1])
-                                        if dmatch:
-                                            prev_date = parse_date(dmatch.group(1))
-                                    vals = [parse_number(x) for x in flat[:2]]
-                                    if vals[0] is not None and vals[1] is not None:
-                                        result["Payment due date"] = prev_date or result["Payment due date"]
-                                        result["Total Dues"] = fmt_num(vals[0])
-                                        result["Minimum payable"] = fmt_num(vals[1])
-                                        break
-
-                # fallback: simple search for Minimum Amount Due and Total Dues
-                if result["Minimum payable"] == "N/A":
-                    m = re.search(r"minimum amount due\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                    if m:
-                        result["Minimum payable"] = fmt_num(m.group(1))
-                if result["Total Dues"] == "N/A":
-                    m = re.search(r"total dues\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                    if m:
-                        result["Total Dues"] = fmt_num(m.group(1))
-
-            # BOB heuristics (Bank of Baroda)
-            if is_bob:
-                # Look for a pattern where a date is followed by two numbers and 'DR' token, e.g. "02/10/2025 1,409.42 28,188.33 DR"
-                for ln in lines:
-                    m = re.search(r"(\d{2}/\d{2}/\d{4})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(?:DR|Dr|dr)\b", ln)
-                    if m:
-                        d = parse_date(m.group(1))
-                        a1 = parse_number(m.group(2))
-                        a2 = parse_number(m.group(3))
-                        # choose mapping: smaller value is minimum, larger is total
-                        if a1 is not None and a2 is not None:
-                            if a1 <= a2:
-                                result["Payment due date"] = d
-                                result["Minimum payable"] = fmt_num(a1)
-                                result["Total Dues"] = fmt_num(a2)
-                            else:
-                                result["Payment due date"] = d
-                                result["Minimum payable"] = fmt_num(a2)
-                                result["Total Dues"] = fmt_num(a1)
+                                    summary["Payment due date"] = d
+                                    summary["Minimum payable"] = fmt_rupee(n2)
+                                    summary["Total Dues"] = fmt_rupee(n1)
                             break
-
-                # If not found, look for any "DR" occurrence with two numbers before it
-                if result["Total Dues"] == "N/A":
-                    m2 = re.search(r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(?:DR|Dr|dr)\b", text_all)
-                    if m2:
-                        a1 = parse_number(m2.group(1)); a2 = parse_number(m2.group(2))
-                        if a1 is not None and a2 is not None:
-                            if a1 <= a2:
-                                result["Minimum payable"] = fmt_num(a1)
-                                result["Total Dues"] = fmt_num(a2)
-                            else:
-                                result["Minimum payable"] = fmt_num(a2)
-                                result["Total Dues"] = fmt_num(a1)
-
-                # BOB also prints credit limits as a list of four numbers; try to find any line with four numbers and map by heuristics
-                m4 = re.search(r"((?:[\d,]+\.\d{2}\s+){3}[\d,]+\.\d{2})", text_all)
-                if m4 and result["Total Dues"] == "N/A":
-                    nums = re.findall(r"[\d,]+\.\d{2}", m4.group(1))
-                    nums_f = [parse_number(x) for x in nums]
-                    # try mapping: guess which is closing/total: pick the one that is followed by "DR" in another nearby chunk
-                    # fallback: choose the smallest non-zero as minimum and one in middle as total (heuristic)
-                    if nums_f and len(nums_f) >= 4:
-                        possible_total = max(nums_f)
-                        possible_min = min(nums_f)
-                        result["Total Dues"] = fmt_num(possible_total)
-                        result["Minimum payable"] = fmt_num(possible_min)
-
-            # Generic fallback: sometimes numbers exist in table rows with exactly two numbers (total and min)
-            if result["Total Dues"] == "N/A" or result["Minimum payable"] == "N/A" or result["Statement date"] == "N/A":
-                # scan for lines that contain both a date and two monetary numbers
-                for ln in lines[:10]:
-                    # check within first few lines of each file: statement header area often there
-                    m = re.search(r"(\d{2}/\d{2}/\d{4}).{0,40}([\d,]+\.\d{2}).{0,40}([\d,]+\.\d{2})", ln)
-                    if m:
-                        d = parse_date(m.group(1))
-                        v1 = parse_number(m.group(2)); v2 = parse_number(m.group(3))
-                        if result["Statement date"] == "N/A":
-                            result["Statement date"] = d
-                        if result["Minimum payable"] == "N/A" or result["Total Dues"] == "N/A":
-                            # assign by magnitude
-                            if v1 is not None and v2 is not None:
-                                if v1 <= v2:
-                                    result["Minimum payable"] = fmt_num(v1)
-                                    result["Total Dues"] = fmt_num(v2)
-                                else:
-                                    result["Minimum payable"] = fmt_num(v2)
-                                    result["Total Dues"] = fmt_num(v1)
-                        break
-
-            # Final safety: ensure Minimum payable and Total Dues are present by searching the whole text for keywords near numbers again
-            if result["Minimum payable"] == "N/A":
-                m = re.search(r"minimum\s*(?:amount)?\s*(?:due|payable)?\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                if m:
-                    result["Minimum payable"] = fmt_num(m.group(1))
-
-            if result["Total Dues"] == "N/A":
-                m = re.search(r"(?:total\s+due|total\s+dues|closing\s+balance|total\s+amount\s+due)\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2})", text_all, re.IGNORECASE)
-                if m:
-                    result["Total Dues"] = fmt_num(m.group(1))
-
-            # Some statements show "Minimum Payment: Rs 1,745.00 Due by 05/08/2025" extract both
-            m = re.search(r"minimum\s*payment\s*[:\-]?\s*(?:rs\.?|rs|₹)?\s*([\d,]+\.\d{2}).{0,40}?due\s*by\s*([A-Za-z0-9,\s]+?\d{4})", text_all, re.IGNORECASE)
-            if m:
-                result["Minimum payable"] = fmt_num(m.group(1))
-                result["Payment due date"] = parse_date(m.group(2))
-
-            # Final normalize: ensure statement date in dd/mm/YYYY if possible (we used parse_date earlier)
-            if result["Statement date"] != "N/A":
-                result["Statement date"] = parse_date(result["Statement date"])
-
-            # return only the 4 requested keys
-            return {
-                "Statement date": result.get("Statement date", "N/A"),
-                "Payment due date": result.get("Payment due date", "N/A"),
-                "Minimum payable": result.get("Minimum payable", "N/A"),
-                "Total Dues": result.get("Total Dues", "N/A")
-            }
+                    break
 
     except Exception as e:
-        st.error(f"⚠️ Error extracting summary: {e}")
-        return {
-            "Statement date": "N/A",
-            "Payment due date": "N/A",
-            "Minimum payable": "N/A",
-            "Total Dues": "N/A"
-        }
+        st.warning(f"Rule extraction error: {e}")
 
-    return {
-        "Statement date": "N/A",
-        "Payment due date": "N/A",
-        "Minimum payable": "N/A",
-        "Total Dues": "N/A"
-    }
+    return summary
 
 # ==============================
-# Excel / CSV extractors
+# OpenAI fallback: send first-page text and ask for 4 fields JSON
+# Requires OPENAI_API_KEY in env
 # ==============================
-def extract_transactions_from_excel(file_bytes, account_name):
-    df = pd.read_excel(BytesIO(file_bytes))
-    return normalize_dataframe(df, account_name)
+def openai_extract_summary(pdf_bytes, timeout_sec=20) -> Dict[str, Any]:
+    if not OPENAI_API_KEY:
+        st.error("OpenAI API key not set (OPENAI_API_KEY). AI fallback disabled.")
+        return {"Statement date":"N/A","Payment due date":"N/A","Minimum payable":"N/A","Total Dues":"N/A"}
 
-def extract_transactions_from_csv(file_bytes, account_name):
-    df = pd.read_csv(BytesIO(file_bytes))
-    return normalize_dataframe(df, account_name)
+    # assemble text (first 2-3 pages only)
+    pdf_file = BytesIO(pdf_bytes)
+    text_all = ""
+    with pdfplumber.open(pdf_file) as pdf:
+        for p in pdf.pages[:3]:
+            text_all += (p.extract_text() or "") + "\n"
 
-def normalize_dataframe(df, account_name):
-    col_map = {
-        "date": "Date",
-        "transaction date": "Date",
-        "txn date": "Date",
-        "description": "Merchant",
-        "narration": "Merchant",
-        "merchant": "Merchant",
-        "amount": "Amount",
-        "debit": "Debit",
-        "credit": "Credit",
-        "type": "Type"
-    }
-    df_renamed = {}
-    for col in df.columns:
-        key = col.lower().strip()
-        if key in col_map:
-            df_renamed[col] = col_map[key]
+    # truncate to token-safe length (approx)
+    prompt_text = text_all[:3500]
 
-    df = df.rename(columns=df_renamed)
+    system_msg = (
+        "You are an assistant that extracts exactly four fields from a credit card statement page: "
+        "Statement date, Payment due date, Minimum payable, Total Dues. "
+        "Return ONLY a JSON object with these keys exactly: "
+        '{"Statement date","Payment due date","Minimum payable","Total Dues"} '
+        "Dates should be in dd/mm/YYYY format where possible; amounts should include currency (₹) and two decimals. "
+        "If a field cannot be determined, set its value to \"N/A\". "
+        "Do not include any extra commentary."
+    )
 
-    if "Debit" in df and "Credit" in df:
-        df["Amount"] = df["Debit"].fillna(0) - df["Credit"].fillna(0)
-        df["Type"] = df.apply(lambda x: "DR" if x["Debit"] > 0 else "CR", axis=1)
-    elif "Amount" in df and "Type" in df:
-        df["Amount"] = df.apply(lambda x: -abs(x["Amount"]) if str(x["Type"]).upper().startswith("CR") else abs(x["Amount"]), axis=1)
-    elif "Amount" in df and "Type" not in df:
-        df["Type"] = "DR"
+    user_msg = f"Extract values from this card statement text. Return JSON only:\n\n{prompt_text}"
 
-    if "Date" not in df or "Merchant" not in df or "Amount" not in df:
-        st.error("❌ Could not detect required columns (Date, Merchant, Amount). Please check your file.")
-        return pd.DataFrame(columns=["Date", "Merchant", "Amount", "Type", "Account"])
-
-    df["Amount"] = df["Amount"].astype(float).round(2)
-    df["Account"] = account_name
-    return df[["Date", "Merchant", "Amount", "Type", "Account"]]
-
-# ==============================
-# Categorize & other helpers
-# ==============================
-def categorize_expenses(df):
-    df["Category"] = df["Merchant"].apply(get_category)
-    return df
-
-def add_new_vendor(merchant, category):
-    global vendor_map
-    new_row = pd.DataFrame([[merchant.lower(), category]], columns=["merchant", "category"])
-    vendor_map = pd.concat([vendor_map, new_row], ignore_index=True)
-    vendor_map.drop_duplicates(subset=["merchant"], keep="last", inplace=True)
-    vendor_map.to_csv(VENDOR_FILE, index=False)
-
-def convert_df_to_csv(df):
-    df["Amount"] = df["Amount"].round(2)
-    return df.to_csv(index=False).encode("utf-8")
-
-def convert_df_to_excel(df):
-    df["Amount"] = df["Amount"].round(2)
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Expenses", float_format="%.2f")
-    return output.getvalue()
-
-# ==============================
-# UI: Display summary neatly
-# ==============================
-def display_summary(summary, account_name):
-    st.subheader(f"📋 Statement Summary — {account_name}")
-    def card_html(label, value, color, icon=""):
-        return f"""
-        <div style="background:{color};padding:10px;border-radius:10px;margin:6px;text-align:center;color:white;font-weight:600;">
-            <div style="font-size:14px;">{icon} {label}</div>
-            <div style="font-size:20px;margin-top:8px;">{value}</div>
-        </div>
-        """
-    col1, col2, col3, col4 = st.columns([2,2,2,2])
-    with col1:
-        st.markdown(card_html("📅 Statement date", summary.get("Statement date","N/A"), "#0275d8"), unsafe_allow_html=True)
-    with col2:
-        st.markdown(card_html("⏰ Payment due date", summary.get("Payment due date","N/A"), "#f0ad4e"), unsafe_allow_html=True)
-    with col3:
-        st.markdown(card_html("⚠️ Minimum payable", summary.get("Minimum payable","N/A"), "#f39c12"), unsafe_allow_html=True)
-    with col4:
-        st.markdown(card_html("💰 Total Dues", summary.get("Total Dues","N/A"), "#5cb85c"), unsafe_allow_html=True)
+    try:
+        # Use chat completion
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",  # may change depending on your account availability
+            messages=[
+                {"role":"system","content":system_msg},
+                {"role":"user","content":user_msg}
+            ],
+            max_tokens=400,
+            temperature=0.0,
+            timeout=timeout_sec
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        # sanitize content: sometimes the model wraps in ``` or text. Extract JSON
+        json_text = content
+        # remove markdown fences
+        json_text = re.sub(r"^```json\s*","", json_text, flags=re.IGNORECASE)
+        json_text = re.sub(r"```$","", json_text, flags=re.IGNORECASE).strip()
+        # find first { ... }
+        jmatch = re.search(r"(\{.*\})", json_text, flags=re.DOTALL)
+        if jmatch:
+            json_text = jmatch.group(1)
+        data = json.loads(json_text)
+        # normalize and ensure keys
+        out = {}
+        for k in ["Statement date","Payment due date","Minimum payable","Total Dues"]:
+            v = data.get(k, "N/A") if isinstance(data, dict) else "N/A"
+            # format date/amount
+            if "date" in k.lower() and v!="N/A":
+                v = parse_date(v)
+            if "payable" in k.lower() or "dues" in k.lower():
+                if v!="N/A":
+                    # try to parse numeric and format
+                    n = parse_number(v)
+                    v = fmt_rupee(n) if n is not None else v
+            out[k] = v
+        return out
+    except Exception as e:
+        st.warning(f"OpenAI extraction failed: {e}")
+        return {"Statement date":"N/A","Payment due date":"N/A","Minimum payable":"N/A","Total Dues":"N/A"}
 
 # ==============================
-# Streamlit App
+# Main Streamlit UI
 # ==============================
-st.title("💳 Credit Card Expense Analyzer — Summary + Transactions")
-st.write("Upload unlocked Credit Card statements (PDF/CSV/XLSX). The app extracts transactions and a 4-field summary: Statement date, Payment due date, Minimum payable, Total Dues.")
+st.title("💳 Credit Card Statement — Summary + Transactions (AI fallback)")
+st.write("Uploads: PDF/CSV/XLSX. Summary fields: Statement date, Payment due date, Minimum payable, Total Dues.")
 
-uploaded_files = st.file_uploader("Upload Statements", type=["pdf","csv","xlsx"], accept_multiple_files=True)
+use_ai = st.checkbox("Use AI fallback when rules fail", value=USE_AI_FALLBACK_DEFAULT)
+if use_ai and not OPENAI_API_KEY:
+    st.warning("AI fallback enabled but OPENAI_API_KEY not found in env — please set it to use AI fallback.")
+
+uploaded_files = st.file_uploader("Upload statements (multiple)", type=["pdf","csv","xlsx"], accept_multiple_files=True)
 
 if uploaded_files:
     all_data = pd.DataFrame(columns=["Date","Merchant","Amount","Type","Account"])
-    for uploaded_file in uploaded_files:
-        # Read once (bytes) so we can open multiple times
+    for up in uploaded_files:
+        st.markdown(f"### 📄 {up.name}")
+        # read bytes once
         try:
-            pdf_bytes = uploaded_file.read()
+            raw = up.read()
         except Exception:
-            uploaded_file.seek(0)
-            pdf_bytes = uploaded_file.read()
+            up.seek(0)
+            raw = up.read()
+        account_name = st.text_input(f"Account name for {up.name}", value=up.name)
 
-        account_name = st.text_input(f"Enter account name for {uploaded_file.name}", value=uploaded_file.name)
+        df = pd.DataFrame(columns=["Date","Merchant","Amount","Type","Account"])
+        summary = {"Statement date":"N/A","Payment due date":"N/A","Minimum payable":"N/A","Total Dues":"N/A"}
 
-        if account_name:
-            if uploaded_file.name.lower().endswith(".pdf"):
-                # extract transactions and summary from bytes
-                df = extract_transactions_from_pdf(pdf_bytes, account_name)
-                summary = extract_summary_from_pdf(pdf_bytes)
-                display_summary(summary, uploaded_file.name)
-            elif uploaded_file.name.lower().endswith(".csv"):
-                df = extract_transactions_from_csv(pdf_bytes, account_name)
-                summary = {
-                    "Statement date": "N/A",
-                    "Payment due date": "N/A",
-                    "Minimum payable": "N/A",
-                    "Total Dues": "N/A"
-                }
-                display_summary(summary, uploaded_file.name)
-            elif uploaded_file.name.lower().endswith(".xlsx"):
-                df = extract_transactions_from_excel(pdf_bytes, account_name)
-                summary = {
-                    "Statement date": "N/A",
-                    "Payment due date": "N/A",
-                    "Minimum payable": "N/A",
-                    "Total Dues": "N/A"
-                }
-                display_summary(summary, uploaded_file.name)
-            else:
-                df = pd.DataFrame()
+        if up.name.lower().endswith(".pdf"):
+            # transactions
+            try:
+                df = extract_transactions_from_pdf(raw, account_name)
+            except Exception as e:
+                st.error(f"Transaction extraction error: {e}")
+                df = pd.DataFrame(columns=["Date","Merchant","Amount","Type","Account"])
+            # rule extraction
+            try:
+                summary = extract_summary_rules(raw)
+            except Exception as e:
+                st.warning(f"Rule summary extraction error: {e}")
 
-            all_data = pd.concat([all_data, df], ignore_index=True)
+            # if any field missing and AI allowed -> call OpenAI
+            missing = [k for k,v in summary.items() if v=="N/A"]
+            if missing and use_ai:
+                st.info("Calling AI fallback to extract missing fields...")
+                ai_out = openai_extract_summary(raw)
+                # merge preferring rule-based (only replace N/A)
+                for k,v in ai_out.items():
+                    if summary.get(k,"N/A") == "N/A" and v:
+                        summary[k] = v
+
+            display_cols = st.columns(4)
+            with display_cols[0]:
+                st.caption("📅 Statement date")
+                st.header(summary.get("Statement date","N/A"))
+            with display_cols[1]:
+                st.caption("⏰ Payment due date")
+                st.header(summary.get("Payment due date","N/A"))
+            with display_cols[2]:
+                st.caption("⚠️ Minimum payable")
+                st.header(summary.get("Minimum payable","N/A"))
+            with display_cols[3]:
+                st.caption("💰 Total Dues")
+                st.header(summary.get("Total Dues","N/A"))
+
+        elif up.name.lower().endswith(".csv"):
+            try:
+                df = pd.read_csv(BytesIO(raw))
+                df = normalize_dataframe(df, account_name)
+            except Exception as e:
+                st.error(f"CSV read error: {e}")
+        elif up.name.lower().endswith(".xlsx"):
+            try:
+                df = pd.read_excel(BytesIO(raw))
+                df = normalize_dataframe(df, account_name)
+            except Exception as e:
+                st.error(f"XLSX read error: {e}")
+
+        all_data = pd.concat([all_data, df], ignore_index=True)
 
     if not all_data.empty:
         all_data = categorize_expenses(all_data)
@@ -664,35 +426,32 @@ if uploaded_files:
         st.subheader("📑 Extracted Transactions")
         st.dataframe(all_data.style.format({"Amount":"{:,.2f}"}))
 
-        # Unknown merchants handling
-        others_df = all_data[all_data["Category"] == "Others"]
+        # unknown merchant handling
+        others_df = all_data[all_data["Category"]=="Others"]
         if not others_df.empty:
-            st.subheader("⚡ Assign Categories for Unknown Merchants")
+            st.subheader("⚡ Assign categories for unknown merchants")
             for merchant in others_df["Merchant"].unique():
                 category = st.selectbox(
                     f"Select category for {merchant}:",
-                    ["Food", "Shopping", "Travel", "Utilities", "Entertainment", "Groceries", "Jewellery", "Healthcare", "Fuel", "Electronics", "Banking", "Insurance", "Education", "Others"],
+                    ["Food","Shopping","Travel","Utilities","Entertainment","Groceries","Jewellery","Healthcare","Fuel","Electronics","Banking","Insurance","Education","Others"],
                     key=merchant
                 )
-                if category != "Others":
+                if category!="Others":
                     add_new_vendor(merchant, category)
-                    all_data.loc[all_data["Merchant"] == merchant, "Category"] = category
+                    all_data.loc[all_data["Merchant"]==merchant,"Category"] = category
                     st.success(f"✅ {merchant} categorized as {category}")
 
         st.subheader("📊 Expense Analysis")
-        expenses = all_data[all_data["Amount"] > 0]
-        total_spent = expenses["Amount"].sum()
-        st.write("💰 **Total Spent:**", f"{total_spent:,.2f}")
+        expenses = all_data[all_data["Amount"]>0]
+        st.write("💰 **Total Spent:**", f"{expenses['Amount'].sum():,.2f}")
         st.bar_chart(expenses.groupby("Category")["Amount"].sum())
-        st.write("🏦 **Top 10 Merchants**")
+        st.write("🏦 Top merchants")
         top_merchants = expenses.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head(10)
         st.dataframe(top_merchants.apply(lambda x: f"{x:,.2f}"))
 
-        # Export
         csv_data = convert_df_to_csv(all_data)
         excel_data = convert_df_to_excel(all_data)
-        st.download_button("⬇️ Download as CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
-        st.download_button("⬇️ Download as Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+        st.download_button("⬇️ Download CSV", csv_data, file_name="expenses_all.csv", mime="text/csv")
+        st.download_button("⬇️ Download Excel", excel_data, file_name="expenses_all.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("✅ App loaded successfully — upload your statements to get started.")
+    st.info("Upload one or more credit card statements (PDF/CSV/XLSX).")
