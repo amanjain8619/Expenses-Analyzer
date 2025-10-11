@@ -1,6 +1,7 @@
-streamlit>=1.24
-pandas
-pdfplumber
-rapidfuzz
-xlsxwriter
-openpyxl
+streamlit>=1.25.0
+pandas>=1.5.0
+pdfplumber>=0.7.1
+rapidfuzz>=2.0.0
+openai>=1.0.0
+xlsxwriter>=3.0.0
+python-dateutil>=2.8.0
